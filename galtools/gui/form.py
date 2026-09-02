@@ -33,14 +33,21 @@ def parse_number(raw):
     return float(raw)
 
 
-class PathEdit(QComboBox):
-    """可编辑下拉框：既能敲/粘路径，也能从最近用过的里挑，还能拖文件夹进来。"""
+class HistoryEdit(QComboBox):
+    """可编辑下拉框：既能敲/粘，也能从最近用过的里挑。"""
 
     def __init__(self, placeholder=''):
         super().__init__()
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.NoInsert)
         self.lineEdit().setPlaceholderText(placeholder)
+
+
+class PathEdit(HistoryEdit):
+    """再加拖放：拖文件夹进来即填路径，拖文件则取其所在目录。"""
+
+    def __init__(self, placeholder=''):
+        super().__init__(placeholder)
         self.setAcceptDrops(True)
         self.lineEdit().setAcceptDrops(False)
 
@@ -99,11 +106,23 @@ def _build_number(spec_field):
 
 
 def _build_text(spec_field):
+    # history=True 的字段换成可编辑下拉框：声优名、id 这类值往往要反复查同几个。
+    if spec_field.history:
+        edit = HistoryEdit(spec_field.placeholder)
+        if spec_field.default is not None:
+            edit.setCurrentText(str(spec_field.default))
+        return (edit, edit, edit.currentTextChanged,
+                lambda: edit.currentText().strip())
     edit = QLineEdit()
     if spec_field.default is not None:
         edit.setText(str(spec_field.default))
     edit.setPlaceholderText(spec_field.placeholder)
     return edit, edit, edit.textChanged, lambda: edit.text().strip()
+
+
+def _keeps_history(spec_field):
+    """哪些字段要记「最近用过」：目录一律记，别的看 Field.history。"""
+    return spec_field.kind == DIR or spec_field.history
 
 
 def _fmt_default(value):
@@ -206,25 +225,27 @@ class ToolForm(QWidget):
         for widget in self._containers.values():
             widget.setEnabled(enabled)
 
-    # ---------- 目录历史 ----------
+    # ---------- 输入历史 ----------
     def _history_key(self, field_key):
         return 'history/%s/%s' % (self.spec.id, field_key)
 
     def _restore_history(self):
         for f in self.spec.fields:
-            if f.kind != DIR:
+            if not _keeps_history(f):
                 continue
             items = self._settings.value(self._history_key(f.key)) or []
             if isinstance(items, str):
                 items = [items]
+            if not items:
+                continue      # 没历史就别动，免得把 Field.default 洗掉
             editor = self._editors[f.key]
             editor.addItems(items)
-            editor.setCurrentText(items[0] if items else '')
+            editor.setCurrentText(items[0])
 
     def remember_paths(self):
-        """把本次实际用过的目录记进历史，供下次直接下拉选。"""
+        """把本次实际用过的值记进历史，供下次直接下拉选。"""
         for f in self.spec.fields:
-            if f.kind != DIR:
+            if not _keeps_history(f):
                 continue
             value = self._getters[f.key]()
             if not value:
