@@ -75,6 +75,20 @@ class Credit:
     note: str = ''
     role: str = ''
 
+    # 「原名」三列（产出里的 Title1 / Cast1 / As1）的取值。原名本就是拉丁字母时
+    # 接口不给 alttitle / original，直接落格会得到一列空白，所以退回罗马字。
+    @property
+    def title_orig(self):
+        return self.title_ja or self.title
+
+    @property
+    def cast_orig(self):
+        return self.cast_ja or self.cast
+
+    @property
+    def alias_orig(self):
+        return self.alias_ja or self.alias
+
 
 @dataclass
 class StaffCredits:
@@ -107,6 +121,10 @@ class Common:
     title_ja: str = ''
     released: str = ''
     casts: list = field(default_factory=list)
+
+    @property
+    def title_orig(self):
+        return self.title_ja or self.title
 
 
 def released_sort_key(released):

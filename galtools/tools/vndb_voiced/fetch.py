@@ -379,7 +379,7 @@ def intersect(items):
         for by_vid in maps:
             seen, one = set(), []
             for credit in by_vid[vid]:
-                text = credit.cast_ja or credit.cast
+                text = credit.cast_orig
                 if text not in seen:
                     seen.add(text)
                     one.append((text, url_for(credit.cid)))

@@ -13,8 +13,9 @@ import os
 import re
 from .model import ROLES, url_for
 
-# 每人一页的列。前 8 列沿用旧脚本的表头与列宽（Title1/Cast1/As1 是日文原名），
-# 末尾新增 Role——角色主次是判断「这人在这部里是主役还是路人」的关键信息。
+# 每人一页的列。前 8 列沿用旧脚本的表头与列宽（Title1/Cast1/As1 是原名，原名本就
+# 是拉丁字母时退回罗马字，不留空列），末尾新增 Role——角色主次是判断「这人在这部里
+# 是主役还是路人」的关键信息。
 HEADERS = ('Title', 'Released', 'Cast', 'As', 'Note',
            'Title1', 'Cast1', 'As1', 'Role')
 WIDTHS = (46, 11, 30, 20, 10, 46, 30, 20, 10)
@@ -169,9 +170,9 @@ def _staff_sheet(wb, item, used, tid, font):
         _put(ws, row, 3, credit.cast, char_url, font)
         _put(ws, row, 4, credit.alias)
         _put(ws, row, 5, credit.note)
-        _put(ws, row, 6, credit.title_ja, vn_url, font)
-        _put(ws, row, 7, credit.cast_ja, char_url, font)
-        _put(ws, row, 8, credit.alias_ja)
+        _put(ws, row, 6, credit.title_orig, vn_url, font)
+        _put(ws, row, 7, credit.cast_orig, char_url, font)
+        _put(ws, row, 8, credit.alias_orig)
         _put(ws, row, 9, credit.role)
     _finish(ws, WIDTHS, len(item.credits), tid)
 
@@ -195,7 +196,7 @@ def _common_sheet(wb, items, common, used, tid, font):
         vn_url = url_for(entry.vid)
         _put(ws, row, 1, entry.released)
         _put(ws, row, 2, entry.title, vn_url, font)
-        _put(ws, row, 3, entry.title_ja, vn_url, font)
+        _put(ws, row, 3, entry.title_orig, vn_url, font)
         for i, casts in enumerate(entry.casts):
             # 一个人在同一部里配多个角色时，链接指向谁都不对，索性不加。
             link = casts[0][1] if len(casts) == 1 else None

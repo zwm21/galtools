@@ -17,7 +17,7 @@ from galtools.core.context import Cancelled, RunContext
 from galtools.tools import vndb_voiced as tool
 from galtools.tools.vndb_voiced import api, cli, fetch, xlsx
 from galtools.tools.vndb_voiced.model import (
-    Credit, Staff, StaffCredits, label, released_sort_key, url_for,
+    Common, Credit, Staff, StaffCredits, label, released_sort_key, url_for,
 )
 
 
@@ -156,6 +156,20 @@ def test_label_and_url():
     assert label('Aoi Kaoru', '', '') == 'Aoi Kaoru'
     assert url_for('v17') == 'https://vndb.org/v17'
     assert url_for('') is None
+
+
+def test_orig_falls_back_to_the_latin_text():
+    # 原名本就是拉丁字母的作品/角色，接口不给 alttitle 与 original，
+    # 「原名」三列不能因此留空。
+    full = Credit(vid='v1', title='Aoi', title_ja='蒼', cast='Chara',
+                  cast_ja='キャラ', alias='Al', alias_ja='アル')
+    assert (full.title_orig, full.cast_orig, full.alias_orig) == ('蒼', 'キャラ',
+                                                                 'アル')
+    bare = Credit(vid='v2', title='Aoi', cast='Chara', alias='Al')
+    assert (bare.title_orig, bare.cast_orig, bare.alias_orig) == ('Aoi', 'Chara',
+                                                                  'Al')
+    assert Common(vid='v1', title='Aoi').title_orig == 'Aoi'
+    assert Common(vid='v1', title='Aoi', title_ja='蒼').title_orig == '蒼'
 
 
 # ---------------- api ----------------
@@ -592,6 +606,31 @@ def test_build_two_people_workbook(tmp_path):
     assert sheet.column_dimensions['A'].width == xlsx.WIDTHS[0]
 
 
+def test_orig_columns_hold_the_latin_text_when_there_is_no_original(tmp_path):
+    """原名列不能因为「原名本就是英文」而空着，链接也要照样加。"""
+    pytest.importorskip('openpyxl')
+    from openpyxl import load_workbook
+
+    bare = Credit(vid='v1', title='Game One', released='1995', cid='c1',
+                  cast='Chara One', alias='Alias One', role='main')
+    a = person('s1', [bare])
+    b = person('s2', [Credit(vid='v1', title='Game One', released='1995',
+                             cid='c3', cast='Bee', role='side')])
+    common = fetch.intersect([a, b])
+    wb = load_workbook(xlsx.save([a, b], common, str(tmp_path)))
+
+    sheet = wb['S1 s1']
+    assert [sheet[c + '2'].value for c in 'FGH'] == ['Game One', 'Chara One',
+                                                    'Alias One']
+    assert sheet['F2'].hyperlink.target == 'https://vndb.org/v1'
+    assert sheet['G2'].hyperlink.target == 'https://vndb.org/c1'
+
+    both = wb['共同出演']
+    assert [c.value for c in both[2]] == ['1995', 'Game One', 'Game One',
+                                          'Chara One', 'Bee']
+    assert both['C2'].hyperlink.target == 'https://vndb.org/v1'
+
+
 def test_build_single_person_has_no_common_sheet(tmp_path):
     pytest.importorskip('openpyxl')
     from openpyxl import load_workbook
@@ -786,6 +825,15 @@ def test_run_table_is_the_common_works(monkeypatch, tmp_path):
                            # 一个人在同一部里配两个角色，链接指向谁都不对
                            ('キャラ壱 / Chara Two', None),
                            ('キャラ参', 'https://vndb.org/c3'))]
+
+
+def test_common_table_falls_back_when_a_title_has_no_original():
+    """屏幕上的表和文件里的表要一致：没有日文原名就摆英文标题，不留空格。"""
+    items = [person('s1', []), person('s2', [])]
+    common = [Common(vid='v1', title='Game One', released='1995',
+                     casts=[[('Chara', url_for('c1'))], [('Bee', url_for('c3'))]])]
+    row = tool._common_table(items, common).rows[0]
+    assert row[2] == ('Game One', 'https://vndb.org/v1')
 
 
 def test_run_table_falls_back_to_one_persons_credits(monkeypatch, tmp_path):

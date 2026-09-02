@@ -74,7 +74,7 @@ def _common_table(items, common):
     rows = []
     for entry in common:
         vn_url = url_for(entry.vid)
-        row = [entry.released, (entry.title, vn_url), (entry.title_ja, vn_url)]
+        row = [entry.released, (entry.title, vn_url), (entry.title_orig, vn_url)]
         for casts in entry.casts:
             # 一个人在同一部里配多个角色时，链接指向谁都不对，索性不加。
             link = casts[0][1] if len(casts) == 1 else None
@@ -90,9 +90,9 @@ def _credits_table(item):
     rows = []
     for c in item.credits:
         vn_url, char_url = url_for(c.vid), url_for(c.cid)
-        rows.append((c.released, (c.title_ja or c.title, vn_url),
-                     (c.cast_ja or c.cast, char_url),
-                     c.alias_ja or c.alias, c.role))
+        rows.append((c.released, (c.title_orig, vn_url),
+                     (c.cast_orig, char_url),
+                     c.alias_orig, c.role))
     return Table(columns=('发售日', 'Title', '角色', 'As', 'Role'), rows=rows,
                  title='%s：%d 条出演记录' % (item.staff.label(),
                                              len(item.credits)))
