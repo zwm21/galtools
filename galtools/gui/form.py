@@ -183,6 +183,14 @@ class ToolForm(QWidget):
             form.addRow('', error)
             signal.connect(lambda *_, rescan=f.rescan: self.changed.emit(rescan))
 
+        # validate 用空串 key 报整表级错误（跨字段规则说不清该挂在谁头上）。
+        # 不显示出来的话「开始」会毫无理由地灰着。
+        self._form_error = QLabel()
+        self._form_error.setStyleSheet('color: #c0392b;')
+        self._form_error.setWordWrap(True)
+        self._form_error.hide()
+        outer.addWidget(self._form_error)
+
         self._restore_history()
 
     # ---------- 取值与校验 ----------
@@ -220,6 +228,9 @@ class ToolForm(QWidget):
             msg = mapping.get(key)
             label.setText(msg or '')
             label.setVisible(bool(msg))
+        overall = mapping.get('')
+        self._form_error.setText(overall or '')
+        self._form_error.setVisible(bool(overall))
 
     def set_editable(self, enabled):
         for widget in self._containers.values():
