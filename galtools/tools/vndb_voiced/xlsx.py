@@ -8,7 +8,6 @@ openpyxl 一律在函数内 import。tests/test_registry.py 断言 discover() �
 的表在 Excel 里能直接按列排序，可读性差别很大。空表不能加 Table——Excel 要求
 ref 至少含一行数据，只有表头的 ref 会让文件被判定为损坏。
 """
-import itertools
 import os
 import re
 from .model import ROLES, url_for
@@ -39,6 +38,13 @@ NON_WORD = re.compile(r'[^\w]+', re.UNICODE)
 SHEET_LIMIT = 31         # Excel 的工作表名长度上限
 OVERVIEW_SHEET = '概览'
 COMMON_SHEET = '共同出演'
+
+# 表名不能与单元格引用同形：'T1' 就是 T 列第 1 行，Excel 会判定文件损坏，打开时
+# 报「已修复的记录: 表」并把表重命名。下面这些要么含下划线，要么长过三个字母
+# （列名最多到 XFD），因此不可能被解析成引用——'Tbl1' 这种就还是会中招。
+OVERVIEW_TABLE = 'Overview'
+COMMON_TABLE = 'Common'
+STAFF_TABLE = 'Staff_%s'
 
 
 # ---------------- 命名 ----------------
@@ -91,6 +97,21 @@ def sheet_title(used, base):
         i += 1
 
 
+def table_name(used, base):
+    """表名在工作簿内必须唯一，且不区分大小写。
+
+    同一个人填两次（`s367, Ono Ryouko`）就会走到重名这一支——重名同样会让
+    Excel 判定文件损坏，和工作表重名不是一回事，得各自去重。
+    """
+    name = base
+    i = 2
+    while name.casefold() in used:
+        name = '%s_%d' % (base, i)
+        i += 1
+    used.add(name.casefold())
+    return name
+
+
 # ---------------- 单元格 ----------------
 def clean(value):
     """去掉 xml 不接受的控制字符（note 里偶有），非字符串原样返回。"""
@@ -118,7 +139,7 @@ def _row(ws, row, values):
         _put(ws, row, col, value)
 
 
-def _finish(ws, widths, rows, tid):
+def _finish(ws, widths, rows, tname):
     """列宽 + 冻结表头 + 套原生表格。rows 为 0 时不加表格。"""
     from openpyxl.utils import get_column_letter
     from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -129,13 +150,13 @@ def _finish(ws, widths, rows, tid):
     if not rows:
         return
     ref = 'A1:%s%d' % (get_column_letter(len(widths)), rows + 1)
-    table = Table(displayName='T%d' % tid, ref=ref)
+    table = Table(displayName=tname, ref=ref)
     table.tableStyleInfo = TableStyleInfo(name=TABLE_STYLE, showRowStripes=True)
     ws.add_table(table)
 
 
 # ---------------- 各页 ----------------
-def _overview(wb, items, used, tid, font):
+def _overview(wb, items, used, tname, font):
     ws = wb.create_sheet(sheet_title(used, OVERVIEW_SHEET))
     _row(ws, 1, OVERVIEW_HEADERS)
     for row, item in enumerate(items, 2):
@@ -155,10 +176,10 @@ def _overview(wb, items, used, tid, font):
         for i, role in enumerate(ROLES):
             _put(ws, row, 6 + i, counts[role])
         _put(ws, row, 6 + len(ROLES), other)
-    _finish(ws, OVERVIEW_WIDTHS, len(items), tid)
+    _finish(ws, OVERVIEW_WIDTHS, len(items), tname)
 
 
-def _staff_sheet(wb, item, used, tid, font):
+def _staff_sheet(wb, item, used, tname, font):
     staff = item.staff
     base = '%s %s' % (staff.original or staff.name, staff.sid)
     ws = wb.create_sheet(sheet_title(used, base))
@@ -174,7 +195,7 @@ def _staff_sheet(wb, item, used, tid, font):
         _put(ws, row, 7, credit.cast_orig, char_url, font)
         _put(ws, row, 8, credit.alias_orig)
         _put(ws, row, 9, credit.role)
-    _finish(ws, WIDTHS, len(item.credits), tid)
+    _finish(ws, WIDTHS, len(item.credits), tname)
 
 
 def cast_columns(items):
@@ -189,7 +210,7 @@ def cast_columns(items):
     return names
 
 
-def _common_sheet(wb, items, common, used, tid, font):
+def _common_sheet(wb, items, common, used, tname, font):
     ws = wb.create_sheet(sheet_title(used, COMMON_SHEET))
     _row(ws, 1, tuple(COMMON_HEADERS) + tuple(cast_columns(items)))
     for row, entry in enumerate(common, 2):
@@ -202,7 +223,7 @@ def _common_sheet(wb, items, common, used, tid, font):
             link = casts[0][1] if len(casts) == 1 else None
             _put(ws, row, 4 + i, ' / '.join(t for t, _ in casts), link, font)
     _finish(ws, tuple(COMMON_WIDTHS) + (CAST_WIDTH,) * len(items),
-            len(common), tid)
+            len(common), tname)
 
 
 # ---------------- 入口 ----------------
@@ -214,12 +235,14 @@ def build(items, common, path):
     font = Font(color=LINK_COLOR, underline='single')
     wb = Workbook()
     wb.remove(wb.active)
-    used, tid = set(), itertools.count(1)
-    _overview(wb, items, used, next(tid), font)
+    used, names = set(), set()
+    _overview(wb, items, used, table_name(names, OVERVIEW_TABLE), font)
     if len(items) > 1:
-        _common_sheet(wb, items, common, used, next(tid), font)
+        _common_sheet(wb, items, common, used,
+                      table_name(names, COMMON_TABLE), font)
     for item in items:
-        _staff_sheet(wb, item, used, next(tid), font)
+        _staff_sheet(wb, item, used,
+                     table_name(names, STAFF_TABLE % item.staff.sid), font)
     wb.save(path)
     return path
 

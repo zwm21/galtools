@@ -8,6 +8,7 @@ _sleep 顺带推进一个假时钟——限流是按 time.monotonic 做的滑动
 import io
 import json
 import os
+import re
 import urllib.error
 from email.message import Message
 
@@ -545,6 +546,37 @@ def test_intersect_edge_cases():
 
 
 # ---------------- 写盘 ----------------
+# Excel 对表名与表结构的要求，openpyxl 一概不校验：违反了要等用户打开文件、看到
+# 「已修复的记录: 表」才发现。这里把规则写成断言，套在每个建簿用例的产出上。
+CELL_REF_RE = re.compile(r'^(?:[A-Za-z]{1,3}\d{1,7}|[Rr]\d+[Cc]\d+)$')
+
+
+def check_excel_tables(wb):
+    seen = set()
+    for ws in wb.worksheets:
+        # TableList.items() 给的是 (名字, ref)，Table 对象要从 values() 拿。
+        for table in ws.tables.values():
+            name = table.displayName
+            assert name == table.name
+            assert not CELL_REF_RE.match(name), '表名 %r 与单元格引用同形' % name
+            assert name.casefold() not in ('c', 'r'), '%r 是保留名' % name
+            assert ' ' not in name and (name[0].isalpha() or name[0] in '_\\')
+            assert name.casefold() not in seen, '表名 %r 在工作簿内重复' % name
+            seen.add(name.casefold())
+            rows = ws[table.ref]
+            assert len(rows) >= 2, '只有表头的 ref 会让 Excel 判定文件损坏'
+            header = [c.value for c in rows[0]]
+            assert all(isinstance(h, str) and h for h in header)
+            assert len(set(header)) == len(header), '列名不能重复'
+            assert [c.name for c in table.tableColumns] == header
+
+
+def test_table_name_dedupes_case_insensitively():
+    used = set()
+    assert xlsx.table_name(used, 'Staff_s1') == 'Staff_s1'
+    assert xlsx.table_name(used, 'staff_S1') == 'staff_S1_2'
+
+
 def test_sheet_title_truncates_and_dedupes():
     used = set()
     assert xlsx.sheet_title(used, 'a/b:c') == 'a_b_c'
@@ -582,6 +614,9 @@ def test_build_two_people_workbook(tmp_path):
 
     wb = load_workbook(path)
     assert wb.sheetnames == ['概览', '共同出演', 'S1 s1', 'S2 s2']
+    check_excel_tables(wb)
+    assert [t for ws in wb.worksheets for t in ws.tables] == [
+        'Overview', 'Common', 'Staff_s1', 'Staff_s2']
     over = wb['概览']
     assert [c.value for c in over[1]] == list(xlsx.OVERVIEW_HEADERS)
     assert [c.value for c in over[2]] == ['S1', 'S1', 's1', 2, 2, 1, 0, 1, 0, 0]
@@ -629,6 +664,18 @@ def test_orig_columns_hold_the_latin_text_when_there_is_no_original(tmp_path):
     assert [c.value for c in both[2]] == ['1995', 'Game One', 'Game One',
                                           'Chara One', 'Bee']
     assert both['C2'].hyperlink.target == 'https://vndb.org/v1'
+
+
+def test_same_person_twice_still_gets_unique_table_names(tmp_path):
+    """`s367, Ono Ryouko` 会解析出同一个人两次，表名撞名同样会让 Excel 修复。"""
+    pytest.importorskip('openpyxl')
+    from openpyxl import load_workbook
+
+    a = person('s1', [rich('v1', 'Game One', 'Chara', 'c1')])
+    wb = load_workbook(xlsx.save([a, a], fetch.intersect([a, a]), str(tmp_path)))
+    check_excel_tables(wb)
+    assert [t for ws in wb.worksheets for t in ws.tables] == [
+        'Overview', 'Common', 'Staff_s1', 'Staff_s1_2']
 
 
 def test_build_single_person_has_no_common_sheet(tmp_path):
