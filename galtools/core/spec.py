@@ -35,11 +35,25 @@ class Field:
 
 
 @dataclass
+class Table:
+    """结果表格：GUI 在预览框下方铺一张可排序、可复制的表。
+
+    单元格是字符串、数字，或 (显示文本, 链接) 二元组——带链接的显示成蓝字，
+    双击用浏览器打开。数字请传 int/float 而不是字符串，否则按字典序排（'10'
+    会排在 '9' 前面）。CLI 不看这个字段：命令行里的等价物是产出的文件本身。
+    """
+    columns: tuple[str, ...]
+    rows: list[tuple] = field(default_factory=list)
+    title: str = ''
+
+
+@dataclass
 class PreviewResult:
     """参数变动后给出的即时反馈。ok=False 时 GUI 禁止启动。"""
     summary: str = ''
     warnings: list[str] = field(default_factory=list)
     ok: bool = True
+    table: Table | None = None
 
 
 @dataclass
@@ -49,6 +63,7 @@ class RunResult:
     warnings: list[str] = field(default_factory=list)
     # 逐项失败，与整体性的 warnings 分开：工具需要把它们落盘成清单。
     failures: list[tuple[str, str]] = field(default_factory=list)
+    table: Table | None = None
 
 
 @dataclass(frozen=True)
@@ -65,3 +80,6 @@ class ToolSpec:
     # 为正数」这类规则常量表达不了，两套机制并存只会让规则散落两处。GUI 与
     # CLI 共用同一份以免漂移。
     validate: Callable[[dict], list[tuple[str, str]]] | None = None
+    # rescan 字段对应的那个按钮叫什么。慢操作的性质差别很大：文件工具是扫盘，
+    # vndb 是打接口，一律叫「扫描」会让人以为要读磁盘。
+    scan_label: str = '扫描'

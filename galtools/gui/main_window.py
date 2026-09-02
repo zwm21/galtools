@@ -5,11 +5,14 @@ import os
 import time
 
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QGuiApplication, QKeySequence, QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QStackedWidget,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from ..core.registry import discover
@@ -18,8 +21,28 @@ from .worker import Bridge, JobRunner
 
 PREVIEW_DEBOUNCE_MS = 300
 MAX_LOGGED_FAILURES = 20
+# 结果表格的列宽上限：作品标题动辄几十个字符，按内容自适应会把一列拉到半屏宽。
+MAX_COLUMN_WIDTH = 320
 
 LEVEL_COLORS = {'warn': '#b7791f', 'error': '#c0392b', 'ok': '#2d7d46'}
+LINK_COLOR = '#0563c1'
+
+
+def _table_cell(value):
+    """一个单元格。(文本, 链接) 做成可双击的蓝字，数字按数值排而非按字典序。"""
+    url = None
+    if isinstance(value, tuple):
+        value, url = value
+    item = QTableWidgetItem()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        item.setData(Qt.DisplayRole, value)
+    else:
+        item.setText('' if value is None else str(value))
+    if url:
+        item.setData(Qt.UserRole, url)
+        item.setForeground(QColor(LINK_COLOR))
+        item.setToolTip('双击打开 ' + url)
+    return item
 
 
 class ToolPage(QWidget):
@@ -58,7 +81,7 @@ class ToolPage(QWidget):
         layout.addWidget(self.form)
 
         buttons = QHBoxLayout()
-        self.scan_btn = QPushButton('扫描')
+        self.scan_btn = QPushButton(spec.scan_label)
         self.scan_btn.setVisible(self.has_rescan and spec.preview is not None)
         buttons.addWidget(self.scan_btn)
         buttons.addStretch(1)
@@ -70,10 +93,34 @@ class ToolPage(QWidget):
         self.preview_box.setVisible(spec.preview is not None)
         layout.addWidget(self.preview_box)
 
+        self.table_title = QLabel()
+        self.table_title.setStyleSheet('color: #666;')
+        self.table_title.hide()
+        layout.addWidget(self.table_title)
+
+        self.table = QTableWidget()
+        self.table.hide()
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSortingEnabled(True)
+        self.table.setMinimumHeight(140)
+        self.table.setToolTip('点表头排序；双击蓝字在浏览器打开；Ctrl+C 复制选中区域')
+        self.table.doubleClicked.connect(self._open_cell_link)
+        copy = QShortcut(QKeySequence.Copy, self.table)
+        copy.setContext(Qt.WidgetShortcut)
+        copy.activated.connect(self._copy_table)
+        layout.addWidget(self.table, 1)
+
         self.start_btn = QPushButton('开始')
         self.start_btn.setMinimumHeight(32)
         layout.addWidget(self.start_btn)
         layout.addStretch(1)
+        # 表格露出时要把这个弹簧压平，否则两者对半分掉多出来的纵向空间。
+        self._layout = layout
+        self._stretch_index = layout.count() - 1
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -85,7 +132,8 @@ class ToolPage(QWidget):
         self.start_btn.clicked.connect(self._on_start)
 
         if self.stale:
-            self.preview_box.setPlainText('尚未扫描，点「扫描」统计。')
+            self.preview_box.setPlainText('尚未%s，点「%s」查看统计。'
+                                          % (spec.scan_label, spec.scan_label))
         self.refresh_start_enabled()
 
     # ---------- 交互 ----------
@@ -107,13 +155,65 @@ class ToolPage(QWidget):
         else:
             self.runRequested.emit()
 
-    def mark_stale(self, reason='参数已改，点「扫描」重新统计。'):
+    def mark_stale(self, reason=None):
         if not self.has_rescan or self.spec.preview is None:
             return
         self.stale = True
         self.preview_ok = None
         self._debounce.stop()
-        self.preview_box.setPlainText(reason)
+        self.preview_box.setPlainText(
+            reason or '参数已改，点「%s」重新统计。' % self.spec.scan_label)
+        # 数据集已失效，表里的行说的是上一次的事。
+        self.show_table(None)
+
+    # ---------- 结果表格 ----------
+    def show_table(self, table):
+        """铺表格。table 为空时收起，把纵向空间还给上面的表单。"""
+        visible = table is not None and bool(table.rows)
+        self._layout.setStretch(self._stretch_index, 0 if visible else 1)
+        self.table.setVisible(visible)
+        self.table_title.setVisible(visible and bool(table.title))
+        if not visible:
+            self.table.clear()
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            return
+        self.table_title.setText(table.title)
+        # 边插边排会打乱行序，填完再开。
+        self.table.setSortingEnabled(False)
+        self.table.clear()
+        self.table.setColumnCount(len(table.columns))
+        self.table.setHorizontalHeaderLabels([str(c) for c in table.columns])
+        self.table.setRowCount(len(table.rows))
+        for r, row in enumerate(table.rows):
+            for c, value in enumerate(row):
+                self.table.setItem(r, c, _table_cell(value))
+        header = self.table.horizontalHeader()
+        # 清掉排序指示器：重新开启排序会照它再排一遍，把工具给的顺序打乱。
+        header.setSortIndicator(-1, Qt.AscendingOrder)
+        self.table.setSortingEnabled(True)
+        self.table.resizeColumnsToContents()
+        for c in range(self.table.columnCount()):
+            if header.sectionSize(c) > MAX_COLUMN_WIDTH:
+                header.resizeSection(c, MAX_COLUMN_WIDTH)
+
+    def _open_cell_link(self, index):
+        url = index.data(Qt.UserRole)
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _copy_table(self):
+        """选中区域按 TSV 复制，粘进 Excel 正好一格对一格。"""
+        rows = []
+        for span in self.table.selectedRanges():
+            for row in range(span.topRow(), span.bottomRow() + 1):
+                cells = []
+                for col in range(span.leftColumn(), span.rightColumn() + 1):
+                    item = self.table.item(row, col)
+                    cells.append(item.text() if item is not None else '')
+                rows.append('\t'.join(cells))
+        if rows:
+            QGuiApplication.clipboard().setText('\n'.join(rows))
 
     # ---------- 状态 ----------
     def validation_errors(self):
@@ -144,11 +244,13 @@ class ToolPage(QWidget):
             text += '\n' + '\n'.join('[!] ' + w for w in result.warnings)
         self.preview_box.setPlainText(text)
         self.preview_ok = bool(result.ok)
+        self.show_table(result.table)
         self.refresh_start_enabled()
 
     def show_preview_error(self, msg):
         self.preview_box.setPlainText('预览失败：' + msg)
         self.preview_ok = False
+        self.show_table(None)
         self.refresh_start_enabled()
 
     def set_busy(self, busy):
@@ -357,12 +459,13 @@ class MainWindow(QMainWindow):
             # 里的数字不再可信。重新标记为过期，免得「开始」还亮着、一点就悄悄
             # 触发那次本该由用户明确发起的慢扫描。先标记再解冻，让 set_busy
             # 末尾的 refresh_start_enabled 一次把按钮状态算对。
-            page.mark_stale('已跑过一轮，点「扫描」重新统计。')
+            page.mark_stale('已跑过一轮，点「%s」重新统计。' % page.spec.scan_label)
             page.set_busy(False)
         self.tree.setEnabled(True)
+        return page
 
     def _on_run_finished(self, result):
-        self._finish_run()
+        page = self._finish_run()
         elapsed = time.monotonic() - self._run_started
         self.progress.setMaximum(100)
         self.progress.setValue(100)
@@ -377,6 +480,9 @@ class MainWindow(QMainWindow):
                 self._append_log('  …其余 %d 项见输出目录内的清单'
                                  % (len(result.failures) - MAX_LOGGED_FAILURES), 'warn')
         self._append_log(result.summary, 'ok')
+        # 必须在 _finish_run 之后：那里的 mark_stale 会把表收起来。
+        if page is not None:
+            page.show_table(result.table)
         self._outputs = list(result.output_paths)
         self.open_btn.setEnabled(bool(self._outputs))
 
