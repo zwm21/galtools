@@ -19,6 +19,19 @@ from ..core.context import Cancelled, RunContext
 PROGRESS_INTERVAL = 0.1
 
 
+def emit(signal, *args):
+    """发信号，但容忍 Bridge 已经没了。
+
+    stop() 只等 5 秒，卡在一个网络请求里的工具可能超时；等它醒过来时窗口已关、
+    Bridge 已析构，emit 会抛 RuntimeError: Signal source has been deleted，在
+    后台线程里变成一段没人能处理的栈。这时候的结果本就没人要了，咽掉即可。
+    """
+    try:
+        signal.emit(*args)
+    except RuntimeError:
+        pass
+
+
 class Bridge(QObject):
     log = Signal(str, str)                 # 消息, 级别
     progress = Signal(int, int, str)       # 已完成, 总数, 说明
@@ -37,7 +50,7 @@ class GuiContext(RunContext):
         self._last_emit = 0.0
 
     def log(self, msg, level='info'):
-        self._bridge.log.emit(msg, level)
+        emit(self._bridge.log, msg, level)
 
     def progress(self, done, total, note=''):
         now = time.monotonic()
@@ -45,7 +58,7 @@ class GuiContext(RunContext):
         if done < total and now - self._last_emit < PROGRESS_INTERVAL:
             return
         self._last_emit = now
-        self._bridge.progress.emit(done, total, note)
+        emit(self._bridge.progress, done, total, note)
 
     def check_cancel(self):
         if self._cancel.is_set():
@@ -67,8 +80,8 @@ class JobRunner:
         self._cancel.set()
 
     def stop(self):
-        """关窗时调用：线程若在关窗后才 emit，Bridge 已析构会抛
-        RuntimeError: Signal source has been deleted。"""
+        """关窗时调用：先把在跑的活停掉，别让它在窗口析构后还往 Bridge 发信号
+        （超时溜过去的那种由上面的 emit 兜住）。"""
         self._stop_current()
 
     def _stop_current(self, timeout=5.0):
@@ -95,9 +108,10 @@ class JobRunner:
             except Cancelled:
                 return
             except Exception as e:
-                self.bridge.preview_failed.emit(gen, '%s: %s' % (type(e).__name__, e))
+                emit(self.bridge.preview_failed, gen,
+                     '%s: %s' % (type(e).__name__, e))
                 return
-            self.bridge.preview_ready.emit(gen, result)
+            emit(self.bridge.preview_ready, gen, result)
 
         self._spawn(job)
         return gen
@@ -113,11 +127,11 @@ class JobRunner:
             try:
                 result = spec.run(params, ctx)
             except Cancelled as c:
-                self.bridge.run_cancelled.emit(getattr(c, 'partial', None))
+                emit(self.bridge.run_cancelled, getattr(c, 'partial', None))
                 return
             except Exception:
-                self.bridge.run_failed.emit(traceback.format_exc())
+                emit(self.bridge.run_failed, traceback.format_exc())
                 return
-            self.bridge.run_finished.emit(result)
+            emit(self.bridge.run_finished, result)
 
         self._spawn(job)
