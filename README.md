@@ -109,4 +109,6 @@ pytest
 
 覆盖三个工具的纯逻辑与 registry 的容错，不含 GUI 自动化测试。`pytest.ini` 里的 `pythonpath = .` 让 `galtools` 无需安装即可导入。vndb 那套测试零联网：`api` 模块只留 `_open` / `_sleep` 两个注入点，测试全打这两处（假睡眠顺带推进一个假时钟，否则限流的滑动窗口永远滚不过去）。
 
-GUI 只做过手动验证。
+GUI 没有自动化测试，手动验证脚本放在 `tests/manual/`：`testpaths = tests` 只收 `test_*.py`，这几个不会被 pytest 捡走，要跑就 `python tests/manual/gui_smoke.py`。`gui_smoke.py` 离屏起真窗口走完「选工具 → 查询 → 预览 → 开始 → 改参数 → 重开窗」一整轮，vndb 那层换成测试里的假接口；`gui_widgets.py` 造一个假工具钉住整表级错误与表格的排序、链接、复制；`vndb_live.py` 是唯一真联网的一个，拿真实 s367 与实测基准对账——接口哪天改了字段，只有它能发现。
+
+前两个脚本都把 `main_window.QSettings` 换成临时 ini。PySide6 里 `QSettings(org, app)` 不看 `setDefaultFormat()`，照样写注册表，不换会把验证用的路径写进用户的真实配置。
