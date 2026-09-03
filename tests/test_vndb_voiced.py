@@ -309,6 +309,8 @@ STAFF_ROWS = {
             'name': 'A. One', 'original': ''}],
     's2': [{'id': 's2', 'aid': 'a9', 'ismain': True,
             'name': 'Beta Two', 'original': 'ベータ'}],
+    's3': [{'id': 's3', 'aid': 'a7', 'ismain': True,
+            'name': 'Gamma Three', 'original': 'ガンマ'}],
 }
 CHAR_ROWS = {
     's1': [{'id': 'c1', 'name': 'Chara One', 'original': 'キャラ壱',
@@ -317,6 +319,8 @@ CHAR_ROWS = {
             'vns': [{'id': 'v1', 'role': 'side'}, {'id': 'v2', 'role': 'appears'}]}],
     's2': [{'id': 'c3', 'name': 'Chara Three', 'original': 'キャラ参',
             'vns': [{'id': 'v1', 'role': 'primary'}, {'id': 'v2', 'role': 'main'}]}],
+    's3': [{'id': 'c4', 'name': 'Chara Four', 'original': 'キャラ肆',
+            'vns': [{'id': 'v1', 'role': 'side'}, {'id': 'v2', 'role': 'main'}]}],
 }
 VN_ROWS = {
     'v1': {'id': 'v1', 'title': 'Game One', 'alttitle': 'ゲーム壱',
@@ -326,10 +330,14 @@ VN_ROWS = {
                   {'staff': {'id': 's1', 'aid': 'a2'},
                    'character': {'id': 'c2'}, 'note': '2024 remake'},
                   {'staff': {'id': 's2', 'aid': 'a9'},
-                   'character': {'id': 'c3'}, 'note': ''}]},
+                   'character': {'id': 'c3'}, 'note': ''},
+                  {'staff': {'id': 's3', 'aid': 'a7'},
+                   'character': {'id': 'c4'}, 'note': ''}]},
     'v2': {'id': 'v2', 'title': 'Game Two', 'alttitle': '', 'released': '1995-01-31',
            'va': [{'staff': {'id': 's2', 'aid': 'a9'},
-                   'character': {'id': 'c3'}, 'note': ''}]},
+                   'character': {'id': 'c3'}, 'note': ''},
+                  {'staff': {'id': 's3', 'aid': 'a7'},
+                   'character': {'id': 'c4'}, 'note': ''}]},
 }
 SEARCH_ROWS = {
     # 搜索命中的是别名行，名字可能与输入毫无关系（实测搜 'Ono Ryouko' 会命中
@@ -658,7 +666,7 @@ def test_build_two_people_workbook(tmp_path):
     a = person('s1', [rich('v1', '=Game One', 'Chara', 'c1'),
                       rich('v2', 'Game Two', 'Other', 'c2', role='side')])
     b = person('s2', [rich('v1', '=Game One', 'Bee', 'c3', role='appears')])
-    common = fetch.intersect([a, b])
+    common = fetch.combos([a, b])
     path = xlsx.save([a, b], common, str(tmp_path))
     assert os.path.basename(path) == '共同出演_S1_S2.xlsx'
 
@@ -701,7 +709,7 @@ def test_orig_columns_hold_the_latin_text_when_there_is_no_original(tmp_path):
     a = person('s1', [bare])
     b = person('s2', [Credit(vid='v1', title='Game One', released='1995',
                              cid='c3', cast='Bee', role='side')])
-    common = fetch.intersect([a, b])
+    common = fetch.combos([a, b])
     wb = load_workbook(xlsx.save([a, b], common, str(tmp_path)))
 
     sheet = wb['S1 s1']
@@ -722,10 +730,113 @@ def test_same_person_twice_still_gets_unique_table_names(tmp_path):
     from openpyxl import load_workbook
 
     a = person('s1', [rich('v1', 'Game One', 'Chara', 'c1')])
-    wb = load_workbook(xlsx.save([a, a], fetch.intersect([a, a]), str(tmp_path)))
+    wb = load_workbook(xlsx.save([a, a], fetch.combos([a, a]), str(tmp_path)))
     check_excel_tables(wb)
     assert [t for ws in wb.worksheets for t in ws.tables] == [
         'Overview', 'Common', 'Staff_s1', 'Staff_s1_2']
+
+
+def test_combo_label_degrades_until_it_fits():
+    def staffs(*names):
+        return [Staff(sid='s%d' % i, name=n) for i, n in enumerate(names, 1)]
+
+    assert xlsx.combo_label(staffs('Ono Ryouko', 'Mizuhashi Kaori')) == (
+        'Ono Ryouko+Mizuhashi Kaori')
+    # 三个人的完整罗马音是 39 字符，超了 31，整组一起降到姓 + 名首字母
+    assert xlsx.combo_label(
+        staffs('Ono Ryouko', 'Mizuhashi Kaori', 'Okajima Tae')) == (
+            'Ono R.+Mizuhashi K.+Okajima T.')
+    five = xlsx.combo_label(staffs(*['Nagai Namae'] * 5))
+    assert five == 'Nagai+Nagai+Nagai+Nagai+Nagai'
+    assert len(five) <= xlsx.SHEET_LIMIT
+    # 姓也塞不下时退到 sid
+    assert xlsx.combo_label(staffs(*['Verylongfamilyname'] * 3)) == 's1+s2+s3'
+
+
+def trio():
+    def cr(vid, cast, cid):
+        return Credit(vid=vid, title='Game ' + vid, title_ja='ゲーム' + vid,
+                      released='1995', cid=cid, cast=cast, role='main')
+
+    return [StaffCredits(staff=Staff(sid='s367', name='Ono Ryouko'),
+                         credits=[cr('v1', 'A1', 'c1'), cr('v2', 'A2', 'c2')]),
+            StaffCredits(staff=Staff(sid='s131', name='Mizuhashi Kaori'),
+                         credits=[cr('v1', 'B1', 'c3'), cr('v2', 'B2', 'c4'),
+                                  cr('v3', 'B3', 'c5')]),
+            StaffCredits(staff=Staff(sid='s359', name='Okajima Tae'),
+                         credits=[cr('v1', 'C1', 'c6'), cr('v3', 'C3', 'c7')])]
+
+
+def test_three_people_get_a_sheet_per_combination(tmp_path):
+    pytest.importorskip('openpyxl')
+    from openpyxl import load_workbook
+
+    items = trio()
+    path = xlsx.save(items, fetch.combos(items), str(tmp_path))
+    assert os.path.basename(path) == (
+        '共同出演_Ono_Ryouko_Mizuhashi_Kaori_Okajima_Tae_3人.xlsx')
+
+    wb = load_workbook(path)
+    check_excel_tables(wb)
+    assert wb.sheetnames == [
+        '概览', '组合',
+        'Ono R.+Mizuhashi K.+Okajima T.',
+        'Ono Ryouko+Mizuhashi Kaori', 'Ono Ryouko+Okajima Tae',
+        'Mizuhashi Kaori+Okajima Tae',
+        'Ono Ryouko s367', 'Mizuhashi Kaori s131', 'Okajima Tae s359']
+    assert [t for ws in wb.worksheets for t in ws.tables] == [
+        'Overview', 'Combos', 'Common_s367_s131_s359', 'Common_s367_s131',
+        'Common_s367_s359', 'Common_s131_s359',
+        'Staff_s367', 'Staff_s131', 'Staff_s359']
+
+    # 每张组合表只有组合内那几个人的列，且与组合同序
+    pair = wb['Mizuhashi Kaori+Okajima Tae']
+    assert [c.value for c in pair[1]] == ['Released', 'Title', 'Title1',
+                                          'Mizuhashi Kaori', 'Okajima Tae']
+    assert [r[1] for r in pair.iter_rows(min_row=2, values_only=True)] == [
+        'Game v1', 'Game v3']
+    assert [r[4] for r in pair.iter_rows(min_row=2, values_only=True)] == [
+        'C1', 'C3']
+
+
+def test_combo_index_maps_full_names_to_sheets(tmp_path):
+    """页名被 31 字符截过，完整罗马音只能靠这一页查，还要能点着跳过去。"""
+    pytest.importorskip('openpyxl')
+    from openpyxl import load_workbook
+
+    items = trio()
+    wb = load_workbook(xlsx.save(items, fetch.combos(items), str(tmp_path)))
+    index = wb['组合']
+    assert [c.value for c in index[1]] == list(xlsx.COMBO_HEADERS)
+    assert [tuple(r) for r in index.iter_rows(min_row=2, values_only=True)] == [
+        (3, 'Ono Ryouko、Mizuhashi Kaori、Okajima Tae', 1,
+         'Ono R.+Mizuhashi K.+Okajima T.'),
+        (2, 'Ono Ryouko、Mizuhashi Kaori', 2, 'Ono Ryouko+Mizuhashi Kaori'),
+        (2, 'Ono Ryouko、Okajima Tae', 1, 'Ono Ryouko+Okajima Tae'),
+        (2, 'Mizuhashi Kaori、Okajima Tae', 2, 'Mizuhashi Kaori+Okajima Tae')]
+    # 内部跳转要写 location；写成 target 会被当成外部 URL
+    assert index['D2'].hyperlink.location == (
+        "'Ono R.+Mizuhashi K.+Okajima T.'!A1")
+
+
+def test_combination_without_shared_works_gets_no_sheet(tmp_path):
+    pytest.importorskip('openpyxl')
+    from openpyxl import load_workbook
+
+    a = person('s1', [credit('v1', 'A', 'c1')])
+    b = person('s2', [credit('v1', 'B', 'c2')])
+    c = person('s3', [credit('v9', 'C', 'c3')])
+    wb = load_workbook(xlsx.save([a, b, c], fetch.combos([a, b, c]),
+                                 str(tmp_path)))
+    check_excel_tables(wb)
+    assert wb.sheetnames == ['概览', '组合', 'S1+S2', 'S1 s1', 'S2 s2', 'S3 s3']
+    index = wb['组合']
+    assert [tuple(r) for r in index.iter_rows(min_row=2, values_only=True)] == [
+        (3, 'S1、S2、S3', 0, '（无共同出演，未建表）'),
+        (2, 'S1、S2', 1, 'S1+S2'),
+        (2, 'S1、S3', 0, '（无共同出演，未建表）'),
+        (2, 'S2、S3', 0, '（无共同出演，未建表）')]
+    assert index['D2'].hyperlink is None
 
 
 def test_build_single_person_has_no_common_sheet(tmp_path):
@@ -765,6 +876,15 @@ def test_validate_is_offline_and_reports_first_bad_target(tmp_path):
     assert '目录不存在' in errors['out_dir']
     assert '作品' in errors['staff']          # 只报第一个坏目标
     assert dict(tool.validate({'staff': '、、'}))['staff'] == '没解析出任何目标'
+
+
+def test_validate_caps_the_number_of_people():
+    ok = ', '.join('s%d' % i for i in range(1, tool.MAX_TARGETS + 1))
+    assert tool.validate({'staff': ok}) == []
+    too_many = ok + ', s99'
+    message = dict(tool.validate({'staff': too_many}))['staff']
+    assert '最多 %d 个人' % tool.MAX_TARGETS in message
+    assert '502 个两两及以上的组合' in message      # 2^9 - 9 - 1
 
 
 def test_eta_text_switches_unit():
@@ -814,6 +934,16 @@ def test_preview_warns_about_the_lonely_single_person(monkeypatch):
     FakeApi(vndb()).install(monkeypatch)
     result = tool.preview({'staff': 's1'}, RunContext())
     assert result.ok and result.warnings == ['只有一个人，不会有共同出演页。']
+
+
+def test_preview_reports_the_combinations_for_three_people(monkeypatch, tmp_path):
+    FakeApi(vndb()).install(monkeypatch)
+    result = tool.preview({'staff': 's1, s2, s3', 'out_dir': str(tmp_path)},
+                          RunContext())
+    assert result.ok
+    assert '共同出演_Alpha_One_Beta_Two_Gamma_Three_3人.xlsx' in result.summary
+    assert '共同出演表：4 个组合' in result.summary
+    assert result.warnings == []          # 三个人还不至于要警告
 
 
 def test_run_writes_a_workbook_and_reuses_the_preview_cache(monkeypatch, tmp_path):
@@ -943,6 +1073,30 @@ def test_run_table_falls_back_to_one_persons_credits(monkeypatch, tmp_path):
     assert [r[2] for r in table.rows] == [('キャラ壱', 'https://vndb.org/c1'),
                                           ('Chara Two', 'https://vndb.org/c2')]
     assert [r[4] for r in table.rows] == ['main', 'side']
+
+
+def test_run_writes_every_combination_for_three_people(monkeypatch, tmp_path):
+    pytest.importorskip('openpyxl')
+    from openpyxl import load_workbook
+
+    FakeApi(vndb()).install(monkeypatch)
+    result = tool.run({'staff': 's1, s2, s3', 'out_dir': str(tmp_path)},
+                      RunContext())
+    assert os.path.basename(result.output_paths[0]) == (
+        '共同出演_Alpha_One_Beta_Two_Gamma_Three_3人.xlsx')
+    assert '共同出演 : 4 个组合有交集（共 4 个组合）' in result.summary
+    assert '  Alpha One、Beta Two : 1 部' in result.summary
+    assert '  Beta Two、Gamma Three : 2 部' in result.summary
+
+    wb = load_workbook(result.output_paths[0])
+    check_excel_tables(wb)
+    assert wb.sheetnames[:2] == ['概览', '组合']
+    assert len([n for n in wb.sheetnames if '+' in n]) == 4
+
+    # 屏幕上摆全员那一档，列头是三个人
+    assert result.table.columns == ('发售日', 'Title', '日文原名',
+                                    'Alpha One', 'Beta Two', 'Gamma Three')
+    assert result.table.title == '共同出演 1 部'
 
 
 # ---------------- 命令行 ----------------
