@@ -127,6 +127,18 @@ class Common:
         return self.title_ja or self.title
 
 
+@dataclass
+class Combo:
+    """一个组合的共同出演结果。
+
+    members 是 items 的下标元组（升序），entries 是这些人共同出演的作品。三人
+    以上时两两组合也各算一份，所以一部三人都在的作品会同时出现在三人那份与三个
+    两两那份里——「这两人都出演」的自然定义如此。
+    """
+    members: tuple
+    entries: list = field(default_factory=list)
+
+
 def released_sort_key(released):
     """产出的排序键。
 

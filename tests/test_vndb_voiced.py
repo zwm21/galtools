@@ -545,6 +545,41 @@ def test_intersect_edge_cases():
     assert fetch.intersect([lone, other]) == []
 
 
+def test_combos_covers_every_subset_of_three():
+    a = person('s1', [credit('v1', 'A1', 'c1'), credit('v2', 'A2', 'c2')])
+    b = person('s2', [credit('v1', 'B1', 'c3'), credit('v2', 'B2', 'c4'),
+                      credit('v3', 'B3', 'c5')])
+    c = person('s3', [credit('v1', 'C1', 'c6'), credit('v3', 'C3', 'c7')])
+    got = fetch.combos([a, b, c])
+    # 人数降序、输入顺序次之；没有共同作品的组合也在列表里，entries 为空。
+    assert [(x.members, [e.vid for e in x.entries]) for x in got] == [
+        ((0, 1, 2), ['v1']),
+        ((0, 1), ['v1', 'v2']),
+        ((0, 2), ['v1']),
+        ((1, 2), ['v1', 'v3']),
+    ]
+    # 每张表只有组合内那几个人的角色列，且与 members 同序。
+    pair = got[3]
+    assert pair.entries[1].casts == [[('B3', url_for('c5'))],
+                                     [('C3', url_for('c7'))]]
+
+
+def test_combos_matches_intersect_and_is_sorted():
+    a = person('s1', [credit('v1', 'x', 'c1', released='1995-01-31'),
+                      credit('v2', 'x', 'c2', released='1995')])
+    b = person('s2', [credit('v1', 'y', 'c3'), credit('v2', 'y', 'c4')])
+    got = fetch.combos([a, b])
+    assert len(got) == 1 and got[0].members == (0, 1)
+    # 年份粒度排在完整日期之前，和 intersect 同一套排序
+    assert [e.vid for e in got[0].entries] == ['v2', 'v1']
+    assert [e.vid for e in fetch.intersect([a, b])] == ['v2', 'v1']
+
+
+def test_combos_of_a_lone_person_is_empty():
+    assert fetch.combos([person('s1', [credit('v1', 'A', 'c1')])]) == []
+    assert fetch.combos([]) == []
+
+
 # ---------------- 写盘 ----------------
 # Excel 对表名与表结构的要求，openpyxl 一概不校验：违反了要等用户打开文件、看到
 # 「已修复的记录: 表」才发现。这里把规则写成断言，套在每个建簿用例的产出上。
