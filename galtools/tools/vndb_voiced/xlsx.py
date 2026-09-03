@@ -27,6 +27,11 @@ COMMON_HEADERS = ('Released', 'Title', 'Title1')
 COMMON_WIDTHS = (11, 46, 46)
 CAST_WIDTH = 30
 
+# 三人以上时的组合索引页。工作表名只有 31 个字符，放不下三个人的完整罗马音，
+# 这一页负责把完整名字与「哪张表」的对应关系摆出来，并提供跳转。
+COMBO_HEADERS = ('人数', '声优', '共同作品数', '工作表')
+COMBO_WIDTHS = (6, 56, 12, 32)
+
 TABLE_STYLE = 'TableStyleMedium2'
 LINK_COLOR = '0563C1'
 
@@ -41,12 +46,15 @@ SHEET_LIMIT = 31         # Excel 的工作表名长度上限
 MAX_STEM = 120
 OVERVIEW_SHEET = '概览'
 COMMON_SHEET = '共同出演'
+COMBO_SHEET = '组合'
+COMBO_SEP = '+'
 
 # 表名不能与单元格引用同形：'T1' 就是 T 列第 1 行，Excel 会判定文件损坏，打开时
 # 报「已修复的记录: 表」并把表重命名。下面这些要么含下划线，要么长过三个字母
 # （列名最多到 XFD），因此不可能被解析成引用——'Tbl1' 这种就还是会中招。
 OVERVIEW_TABLE = 'Overview'
 COMMON_TABLE = 'Common'
+COMBO_TABLE = 'Combos'
 STAFF_TABLE = 'Staff_%s'
 
 
@@ -108,6 +116,38 @@ def sheet_title(used, base):
         i += 1
 
 
+def _name_forms(staff):
+    """一个人的名字，从最全到最省：完整罗马音 → 姓 + 名首字母 → 姓 → sid。"""
+    name = (staff.name or '').strip()
+    parts = name.split()
+    forms = [name]
+    if len(parts) > 1:
+        forms.append('%s %s.' % (parts[0], parts[1][:1]))
+        forms.append(parts[0])
+    forms.append(staff.sid)
+    out = []
+    for form in forms:
+        if form and form not in out:
+            out.append(form)
+    return out or ['unknown']
+
+
+def combo_label(staffs):
+    """组合的工作表名。
+
+    Excel 只给 31 个字符，三个人的完整罗马音一定超（`Ono Ryouko+Mizuhashi
+    Kaori+Okajima Tae` 是 39），所以整组一起降级，取第一个塞得下的写法。连 sid
+    都塞不下时照样返回，交给 sheet_title 截断去重——完整名字在组合索引页里。
+    """
+    ladders = [_name_forms(s) for s in staffs]
+    label = ''
+    for level in range(max(len(l) for l in ladders)):
+        label = COMBO_SEP.join(l[min(level, len(l) - 1)] for l in ladders)
+        if len(label) <= SHEET_LIMIT:
+            break
+    return label
+
+
 def table_name(used, base):
     """表名在工作簿内必须唯一，且不区分大小写。
 
@@ -167,8 +207,8 @@ def _finish(ws, widths, rows, tname):
 
 
 # ---------------- 各页 ----------------
-def _overview(wb, items, used, tname, font):
-    ws = wb.create_sheet(sheet_title(used, OVERVIEW_SHEET))
+def _overview(wb, items, title, tname, font):
+    ws = wb.create_sheet(title)
     _row(ws, 1, OVERVIEW_HEADERS)
     for row, item in enumerate(items, 2):
         staff = item.staff
@@ -190,10 +230,13 @@ def _overview(wb, items, used, tname, font):
     _finish(ws, OVERVIEW_WIDTHS, len(items), tname)
 
 
-def _staff_sheet(wb, item, used, tname, font):
-    staff = item.staff
-    base = '%s %s' % (staff.original or staff.name, staff.sid)
-    ws = wb.create_sheet(sheet_title(used, base))
+def staff_sheet_base(staff):
+    """每人一页的页名：日文原名 + sid，认人比罗马字快。"""
+    return '%s %s' % (staff.original or staff.name, staff.sid)
+
+
+def _staff_sheet(wb, item, title, tname, font):
+    ws = wb.create_sheet(title)
     _row(ws, 1, HEADERS)
     for row, credit in enumerate(item.credits, 2):
         vn_url, char_url = url_for(credit.vid), url_for(credit.cid)
@@ -221,10 +264,12 @@ def cast_columns(items):
     return names
 
 
-def _common_sheet(wb, items, common, used, tname, font):
-    ws = wb.create_sheet(sheet_title(used, COMMON_SHEET))
-    _row(ws, 1, tuple(COMMON_HEADERS) + tuple(cast_columns(items)))
-    for row, entry in enumerate(common, 2):
+def _common_sheet(wb, items, combo, title, tname, font):
+    """一个组合的共同出演页。列头只含这个组合里的人，与 combo.members 同序。"""
+    members = [items[i] for i in combo.members]
+    ws = wb.create_sheet(title)
+    _row(ws, 1, tuple(COMMON_HEADERS) + tuple(cast_columns(members)))
+    for row, entry in enumerate(combo.entries, 2):
         vn_url = url_for(entry.vid)
         _put(ws, row, 1, entry.released)
         _put(ws, row, 2, entry.title, vn_url, font)
@@ -233,13 +278,43 @@ def _common_sheet(wb, items, common, used, tname, font):
             # 一个人在同一部里配多个角色时，链接指向谁都不对，索性不加。
             link = casts[0][1] if len(casts) == 1 else None
             _put(ws, row, 4 + i, ' / '.join(t for t, _ in casts), link, font)
-    _finish(ws, tuple(COMMON_WIDTHS) + (CAST_WIDTH,) * len(items),
-            len(common), tname)
+    _finish(ws, tuple(COMMON_WIDTHS) + (CAST_WIDTH,) * len(members),
+            len(combo.entries), tname)
+
+
+def _combo_index(wb, items, planned, title, tname, font):
+    """组合索引页：完整罗马音 → 哪张表，附跳转链接。
+
+    工作表名被 31 字符截过、还可能因重名加了序号，完整名字必须有地方可查。
+    """
+    from openpyxl.worksheet.hyperlink import Hyperlink
+
+    ws = wb.create_sheet(title)
+    _row(ws, 1, COMBO_HEADERS)
+    for row, (combo, sheet) in enumerate(planned, 2):
+        _put(ws, row, 1, len(combo.members))
+        _put(ws, row, 2, '、'.join(items[i].staff.name or items[i].staff.sid
+                                   for i in combo.members))
+        _put(ws, row, 3, len(combo.entries))
+        cell = _put(ws, row, 4, sheet or '（无共同出演，未建表）')
+        if sheet:
+            # 内部跳转要写 location 而不是 target，后者会被当成外部 URL。
+            cell.hyperlink = Hyperlink(ref=cell.coordinate,
+                                       location="'%s'!A1"
+                                                % sheet.replace("'", "''"))
+            cell.font = font
+    _finish(ws, COMBO_WIDTHS, len(planned), tname)
 
 
 # ---------------- 入口 ----------------
-def build(items, common, path):
-    """写出工作簿，返回 path。common 为空或只有一个人时不建共同出演页。"""
+def build(items, combos, path):
+    """写出工作簿，返回 path。
+
+    combos 是 fetch.combos 的结果（两两及以上的全部组合，含空组合）。两人时沿用
+    旧脚本的单页「共同出演」，哪怕没有交集也留着那张空页；三人以上给每个非空组合
+    各一页，并在前面加一张组合索引页。页名与表名都要先定好再写：索引页排在组合页
+    之前，但它要引用那些页的最终名字。
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font
 
@@ -247,18 +322,38 @@ def build(items, common, path):
     wb = Workbook()
     wb.remove(wb.active)
     used, names = set(), set()
-    _overview(wb, items, used, table_name(names, OVERVIEW_TABLE), font)
-    if len(items) > 1:
-        _common_sheet(wb, items, common, used,
-                      table_name(names, COMMON_TABLE), font)
+    many = len(items) > 2
+
+    overview = sheet_title(used, OVERVIEW_SHEET)
+    index = sheet_title(used, COMBO_SHEET) if many else ''
+    planned = []
+    for combo in combos if len(items) > 1 else ():
+        if not many:
+            planned.append((combo, sheet_title(used, COMMON_SHEET)))
+        elif combo.entries:
+            planned.append((combo, sheet_title(
+                used, combo_label([items[i].staff for i in combo.members]))))
+        else:
+            planned.append((combo, ''))
+
+    _overview(wb, items, overview, table_name(names, OVERVIEW_TABLE), font)
+    if index:
+        _combo_index(wb, items, planned, index,
+                     table_name(names, COMBO_TABLE), font)
+    for combo, title in planned:
+        if not title:
+            continue
+        base = COMMON_TABLE if not many else 'Common_' + '_'.join(
+            items[i].staff.sid or str(i) for i in combo.members)
+        _common_sheet(wb, items, combo, title, table_name(names, base), font)
     for item in items:
-        _staff_sheet(wb, item, used,
+        _staff_sheet(wb, item, sheet_title(used, staff_sheet_base(item.staff)),
                      table_name(names, STAFF_TABLE % item.staff.sid), font)
     wb.save(path)
     return path
 
 
-def save(items, common, target):
+def save(items, combos, target):
     """target 可以是目录也可以是 .xlsx 路径。返回实际写入的路径。"""
     target = os.path.abspath(target or '.')
     if target.lower().endswith('.xlsx'):
@@ -266,4 +361,4 @@ def save(items, common, target):
     else:
         directory, name = target, workbook_name([i.staff for i in items])
     os.makedirs(directory or '.', exist_ok=True)
-    return build(items, common, unique_path(os.path.join(directory, name)))
+    return build(items, combos, unique_path(os.path.join(directory, name)))

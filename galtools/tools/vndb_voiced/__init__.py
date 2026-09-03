@@ -2,7 +2,8 @@
 """vndb 声优出演表：抓 VNDB 上某个声优配过的全部角色，导出 Excel。
 
 填两人以上时额外算出共同出演的作品（旧仓库里这是另一个脚本 compare_voiced_xlsx，
-需要先跑两次抓取再手动喂两个 xlsx 给它；这里合成一步）。
+需要先跑两次抓取再手动喂两个 xlsx 给它；这里合成一步）。三人以上时两两及以上的
+每个组合各出一页，页名是各人的罗马音，另有一张「组合」索引页。
 
 旧版抓 HTML，本版走官方 kana JSON API：更准（角色主次、别名、日文原名都是结构化
 字段，不靠 DOM 猜）也更快。三阶段抓取见 fetch.py。
@@ -23,6 +24,12 @@ from .model import url_for
 SECONDS_PER_VN = 0.045
 SECONDS_PER_STAFF = 2.0
 REFRESH_FLAG = 'refresh_done'
+
+# 人数上限：N 人的两两及以上组合有 2^N-N-1 个，每个非空组合一张工作表。8 人最多
+# 247 张，已经是 Excel 里翻不动的量；再往上只会产出没人看的文件。
+MAX_TARGETS = 8
+# 摘要里最多逐个列出多少个有交集的组合，其余交给工作簿里的「组合」页。
+MAX_LISTED_COMBOS = 12
 
 
 def _apply_refresh(params, ctx):
@@ -98,6 +105,12 @@ def _credits_table(item):
                                              len(item.credits)))
 
 
+def combo_names(items, combo):
+    """组合里各人的罗马音，摘要与索引页共用一种写法。"""
+    return '、'.join(items[i].staff.name or items[i].staff.sid
+                     for i in combo.members)
+
+
 def validate(params):
     """每敲一个键都会跑，只做纯本地判断，绝不联网。"""
     errors = []
@@ -108,6 +121,11 @@ def validate(params):
     targets = fetch.parse_targets(raw)
     if raw and not targets:
         errors.append(('staff', '没解析出任何目标'))
+    if len(targets) > MAX_TARGETS:
+        errors.append(('staff', '最多 %d 个人：%d 个人有 %d 个两两及以上的组合，'
+                                '工作簿会大到没法看'
+                                % (MAX_TARGETS, len(targets),
+                                   2 ** len(targets) - len(targets) - 1)))
     for target in targets:
         kind, value = fetch.classify(target)
         if kind == 'bad':
@@ -153,6 +171,13 @@ def preview(params, ctx):
                     xlsx.workbook_name([r.staff for r in done])))
     if len(done) == 1:
         warnings.append('只有一个人，不会有共同出演页。')
+    elif len(done) > 2:
+        n = len(done)
+        lines.append('共同出演表：%d 个组合（两两及以上），没有交集的不建表'
+                     % (2 ** n - n - 1))
+        if n >= 5:
+            warnings.append('%d 个人最多要写 %d 张共同出演表。'
+                            % (n, 2 ** n - n - 1))
     return PreviewResult(summary='\n'.join(lines), warnings=warnings,
                          ok=not problems, table=table)
 
@@ -182,16 +207,26 @@ def run(params, ctx):
         return RunResult(summary='\n每个人都抓取失败了，没有写出文件。',
                          failures=failures)
 
-    common = fetch.intersect(items) if len(items) > 1 else []
+    groups = fetch.combos(items) if len(items) > 1 else []
     ctx.log('正在写 Excel…')
-    path = xlsx.save(items, common, params.get('out_dir'))
+    path = xlsx.save(items, groups, params.get('out_dir'))
 
     lines = ['\n========== 执行结果 ==========']
     for item in items:
         lines.append('%s : %d 部作品 / %d 个角色'
                      % (item.staff.label(), len(item.vids), len(item.credits)))
-    if len(items) > 1:
-        lines.append('共同出演 : %d 部' % len(common))
+    if len(items) == 2:
+        lines.append('共同出演 : %d 部' % len(groups[0].entries))
+    elif len(items) > 2:
+        shared = [c for c in groups if c.entries]
+        lines.append('共同出演 : %d 个组合有交集（共 %d 个组合）'
+                     % (len(shared), len(groups)))
+        for combo in shared[:MAX_LISTED_COMBOS]:
+            lines.append('  %s : %d 部'
+                         % (combo_names(items, combo), len(combo.entries)))
+        if len(shared) > MAX_LISTED_COMBOS:
+            lines.append('  …其余 %d 个见工作簿里的「组合」页'
+                         % (len(shared) - MAX_LISTED_COMBOS))
     lines += ['输出文件 : %s' % path, '=' * 30, '全部完成。']
 
     warnings = []
@@ -199,8 +234,12 @@ def run(params, ctx):
         warnings.append('%d 个目标没定位到人，已跳过。' % len(unresolved))
     if hard:
         warnings.append('%d 个人抓取失败，已跳过。' % len(hard))
-    table = (_common_table(items, common) if len(items) > 1
-             else _credits_table(items[0]))
+    if groups:
+        # 屏幕上只摆得下一张表，摆全员那一档（groups 按人数降序，它在最前）。
+        full = groups[0]
+        table = _common_table([items[i] for i in full.members], full.entries)
+    else:
+        table = _credits_table(items[0])
     return RunResult(summary='\n'.join(lines), output_paths=[path],
                      warnings=warnings, failures=failures, table=table)
 
@@ -210,10 +249,11 @@ TOOL = ToolSpec(
     name='vndb 声优出演表',
     category='资料',
     description='抓 VNDB 上某个声优配过的全部角色，导出 Excel：一页概览 + 每人'
-                '一页明细。填两人以上时额外算出共同出演的作品。',
+                '一页明细。填两人以上时额外算出共同出演的作品，三人以上按两两'
+                '及以上的组合各出一页。',
     fields=(
         Field(key='staff', kind=TEXT, label='声优', rescan=True, history=True,
-              help='id（s367）、声优页网址或名字，多个用逗号分隔。'
+              help='id（s367）、声优页网址或名字，多个用逗号分隔，最多 8 个人。'
                    '名字有歧义时会列出候选，改填其中的 id 即可。',
               placeholder='s367, s131'),
         Field(key='out_dir', kind=DIR, label='输出目录',
