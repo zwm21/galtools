@@ -627,7 +627,22 @@ def test_workbook_name():
     three = Staff(sid='s3', name='S3')
     assert xlsx.workbook_name([one]) == 'vndb_S1_voiced.xlsx'
     assert xlsx.workbook_name([one, two]) == '共同出演_S1_S2.xlsx'
-    assert xlsx.workbook_name([one, two, three]) == '共同出演_S1_S2等3人.xlsx'
+    assert xlsx.workbook_name([one, two, three]) == '共同出演_S1_S2_S3_3人.xlsx'
+
+
+def test_workbook_name_writes_every_romaji_in_full():
+    staffs = [Staff(sid='s367', name='Ono Ryouko'),
+              Staff(sid='s131', name='Mizuhashi Kaori'),
+              Staff(sid='s359', name='Okajima Tae')]
+    assert xlsx.workbook_name(staffs) == (
+        '共同出演_Ono_Ryouko_Mizuhashi_Kaori_Okajima_Tae_3人.xlsx')
+
+
+def test_workbook_name_falls_back_when_it_would_be_too_long():
+    many = [Staff(sid='s%d' % i, name='Nagai Namae %d' % i) for i in range(9)]
+    name = xlsx.workbook_name(many)
+    assert name == '共同出演_Nagai_Namae_0_Nagai_Namae_1等9人.xlsx'
+    assert len(name) <= xlsx.MAX_STEM + len('.xlsx')
 
 
 def rich(vid, title, cast, cid, released='1995', role='main', note=''):

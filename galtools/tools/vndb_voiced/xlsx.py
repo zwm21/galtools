@@ -36,6 +36,9 @@ CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 NON_WORD = re.compile(r'[^\w]+', re.UNICODE)
 
 SHEET_LIMIT = 31         # Excel 的工作表名长度上限
+# 文件名不设 255 而是 120：出输出目录本身也占路径，整条路径过 260 在 Windows 上
+# 会被一堆 API 拒绝，还要给 unique_path 的 _1 序号留位置。
+MAX_STEM = 120
 OVERVIEW_SHEET = '概览'
 COMMON_SHEET = '共同出演'
 
@@ -53,7 +56,12 @@ def slug(text):
 
 
 def workbook_name(staffs):
-    """单人沿用旧脚本的 vndb_<Name>_voiced.xlsx，多人叫 共同出演_A_B.xlsx。"""
+    """单人沿用旧脚本的 vndb_<Name>_voiced.xlsx，两人叫 共同出演_A_B.xlsx，
+    三人以上把每个人的罗马音都写进去、末尾缀人数。
+
+    名字太多会把路径顶到 Windows 的上限（文件名 255、整条路径 260），所以留了
+    退路：拼出来太长就退回前两人 + 等N人。
+    """
     names = [slug(s.name or s.sid) for s in staffs]
     if not names:
         return 'vndb_voiced.xlsx'
@@ -61,7 +69,10 @@ def workbook_name(staffs):
         return 'vndb_%s_voiced.xlsx' % names[0]
     if len(names) == 2:
         return '共同出演_%s_%s.xlsx' % (names[0], names[1])
-    return '共同出演_%s_%s等%d人.xlsx' % (names[0], names[1], len(names))
+    stem = '共同出演_%s_%d人' % ('_'.join(names), len(names))
+    if len(stem) > MAX_STEM:
+        stem = '共同出演_%s_%s等%d人' % (names[0], names[1], len(names))
+    return stem + '.xlsx'
 
 
 def unique_path(path):
