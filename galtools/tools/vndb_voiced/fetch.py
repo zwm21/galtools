@@ -16,11 +16,12 @@ va 记录，因此必须按 `va[].staff.id == sid` 在客户端再过滤一遍�
 被取消的抓取到不了那一步，不会留下半份缓存。GUI 每改一个非 rescan 字段就会重跑
 预览，没有这层缓存就会连着打 API。
 """
+import itertools
 import re
 
 from . import api
 from .model import (
-    Candidate, Common, Credit, Resolution, Staff, StaffCredits,
+    Candidate, Combo, Common, Credit, Resolution, Staff, StaffCredits,
     released_sort_key, url_for,
 )
 
@@ -352,39 +353,79 @@ def ensure_credits(staffs, ctx, client=None):
 
 
 # ---------------- 交集 ----------------
-def intersect(items):
-    """N 人共同出演：按 vid 求交集，每部作品带上各人在其中配的角色。
-
-    casts 与 items 同序，每项是该人在这部作品里的 [(角色名, 链接)]——一个人在
-    同一部里配多个角色是常态，所以是列表而不是单值。同名角色去重（保留先出现
-    的链接），沿用旧 compare 脚本的行为。
-    """
-    if not items:
-        return []
+def _by_vid(items):
+    """每个人的 vid -> [credit]，顺序与 items 一致。"""
     maps = []
     for item in items:
         by_vid = {}
         for credit in item.credits:
             by_vid.setdefault(credit.vid, []).append(credit)
         maps.append(by_vid)
+    return maps
 
+
+def _entry(vid, maps, members):
+    """一部作品在某个组合下的一行。
+
+    casts 与 members 同序，每项是该人在这部作品里的 [(角色名, 链接)]——一个人在
+    同一部里配多个角色是常态，所以是列表而不是单值。同名角色去重（保留先出现的
+    链接），沿用旧 compare 脚本的行为。
+    """
+    first = maps[members[0]][vid][0]
+    casts = []
+    for i in members:
+        seen, one = set(), []
+        for credit in maps[i][vid]:
+            text = credit.cast_orig
+            if text not in seen:
+                seen.add(text)
+                one.append((text, url_for(credit.cid)))
+        casts.append(one)
+    return Common(vid=vid, title=first.title, title_ja=first.title_ja,
+                  released=first.released, casts=casts)
+
+
+def _in_order(entries):
+    entries.sort(key=lambda x: (released_sort_key(x.released), x.title, x.vid))
+    return entries
+
+
+def intersect(items):
+    """N 人共同出演：按 vid 求交集，每部作品带上各人在其中配的角色。"""
+    if not items:
+        return []
+    maps = _by_vid(items)
     shared = set(maps[0])
     for by_vid in maps[1:]:
         shared &= set(by_vid)
+    members = tuple(range(len(items)))
+    return _in_order([_entry(vid, maps, members) for vid in shared])
+
+
+def combos(items, min_size=2):
+    """两两及以上的**全部**组合，按人数降序、输入顺序次之。没有共同作品的组合
+    也在列表里（entries 为空），调用方自己决定要不要为它建表。
+
+    不对每个组合各跑一次 intersect（那是 2^N 次全量遍历）：一次遍历得到每部作品
+    的出演者集合，再只枚举这个集合自己的子集——一部作品通常只被两三个人共享，
+    代价是 Σ 2^该作品出演者数，比 2^N × 全部记录小几个数量级。
+    """
+    maps = _by_vid(items)
+    holders = {}
+    for i, by_vid in enumerate(maps):
+        for vid in by_vid:
+            holders.setdefault(vid, []).append(i)
+
+    buckets = {}
+    for vid, who in holders.items():
+        for size in range(min_size, len(who) + 1):
+            for members in itertools.combinations(who, size):
+                buckets.setdefault(members, []).append(vid)
 
     out = []
-    for vid in shared:
-        first = maps[0][vid][0]
-        casts = []
-        for by_vid in maps:
-            seen, one = set(), []
-            for credit in by_vid[vid]:
-                text = credit.cast_orig
-                if text not in seen:
-                    seen.add(text)
-                    one.append((text, url_for(credit.cid)))
-            casts.append(one)
-        out.append(Common(vid=vid, title=first.title, title_ja=first.title_ja,
-                          released=first.released, casts=casts))
-    out.sort(key=lambda x: (released_sort_key(x.released), x.title, x.vid))
+    for size in range(len(items), min_size - 1, -1):
+        for members in itertools.combinations(range(len(items)), size):
+            entries = [_entry(vid, maps, members)
+                       for vid in buckets.get(members, ())]
+            out.append(Combo(members=members, entries=_in_order(entries)))
     return out
