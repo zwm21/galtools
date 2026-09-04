@@ -1,2 +1,5 @@
+# 两行都不是硬依赖，装全了才是完整体验：
+# PySide6  只有 GUI（run_gui.py、galtools/gui/）要它，工具的命令行用法不碰 Qt。
+# openpyxl 只有 vndb 声优出演表写 xlsx 时要它，且是在函数内 import，缺了照样列得出工具。
 PySide6>=6.5
 openpyxl>=3.1
