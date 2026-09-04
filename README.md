@@ -26,7 +26,7 @@ pip install -r requirements.txt
 python -m galtools.tools.mjo_text <.mjo 目录> [输出目录]
 ```
 
-输出目录留空时为 `<.mjo 目录>/script_text`。
+输出目录留空时为 `<.mjo 目录>/script_text`。目录里一个 `.mjo` 都没有时什么都不做——合并全文往往是上一次的成果，`'w'` 打开就会把它清成空文件，而命令行没有预览那道闸。
 
 **语音时长筛选**（`galtools/tools/audio_filter/`）按时长区间把语音复制到源目录下的新文件夹，并生成复制清单。不解码音频，直接读 WAV 的 RIFF 头与 Ogg 的 granule position。
 
