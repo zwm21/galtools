@@ -5,6 +5,7 @@
 函数即可，不必改动别处。
 """
 import os
+import re
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -15,11 +16,21 @@ from PySide6.QtWidgets import (
 from ..core.spec import BOOL, DIR, NUMBER, TEXT
 
 HISTORY_LIMIT = 5
+# 只剩一个盘符的写法，末尾的分隔符不能跟着被剥掉。
+DRIVE_ONLY = re.compile(r'^[A-Za-z]:$')
 
 
 def normalize_path(raw):
-    """沿用命令行版 ask_directory 的清洗：Windows「复制为路径」总是带引号。"""
+    """沿用命令行版 ask_directory 的清洗：Windows「复制为路径」总是带引号。
+
+    末尾的分隔符要去掉（`D:\\voice\\` 与 `D:\\voice` 是同一个目录，留着会让历史
+    记录出现两份），但剥到只剩盘符时必须补回来：`E:` 在 Windows 上指的是 E 盘的
+    **当前工作目录**而不是根目录，`os.path.isdir('E:')` 照样为真，于是 validate
+    放行、产出静默落到别处（实测 abspath('E:') 得到的是进程的 cwd）。
+    """
     raw = raw.strip().strip('"').strip("'").rstrip('\\/').strip()
+    if DRIVE_ONLY.match(raw):
+        raw += os.sep
     return raw
 
 
