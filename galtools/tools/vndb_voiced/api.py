@@ -8,9 +8,11 @@
     _open(req, timeout)   发请求
     _sleep(seconds)       睡觉（限流与退避）
 
-限流按官方的 200 请求 / 5 分钟做滑动窗口。睡眠切成小片、片间 check_cancel，
-否则一次长睡会把用户的取消吞掉；取消的粒度是「当前这一个请求」（实测单次
-0.6–3 秒），与 GUI worker 的 5 秒 join 预算相容。
+限流按官方的 200 请求 / 5 分钟做滑动窗口，窗口存在 ctx.session 上而不是 Client
+实例上——一次 run 会建两个 Client（解析一个、抓取一个）。睡眠切成小片、片间
+check_cancel，否则一次长睡会把用户的取消吞掉；取消的粒度是「当前这一个请求」
+（实测单次 0.6–3 秒）。真卡在 socket 上时 GUI 那边不靠等待它退出来保证正确性，
+见 gui/worker.py 顶上的说明。
 """
 import json
 import time
@@ -31,6 +33,10 @@ SLEEP_SLICE = 0.2        # 睡眠切片长度，片间查一次取消
 MAX_ATTEMPTS = 4
 BACKOFF_BASE = 2.0
 MAX_RETRY_AFTER = 60.0   # 服务端让等更久也不等：宁可报错让用户自己决定
+# 滑动窗口存在 ctx.session 里的键，与 fetch 的三个缓存键并列。刻意不进
+# fetch.CACHE_KEYS：勾「重新抓取」清的是抓来的数据，不该把已经打出去的请求
+# 记录也一起忘掉。
+RATE_KEY = 'vndb_rate'
 
 
 class ApiError(Exception):
@@ -83,12 +89,19 @@ def _read(resp, ctx):
 
 
 class Client:
-    """一次抓取用一个实例：限流窗口与请求计数都挂在实例上。"""
+    """一次抓取用一个实例，但限流窗口挂在 ctx.session 上。
+
+    窗口不能跟着实例走：一次 run 里 ensure_resolved 与 ensure_credits 各建一个
+    Client，反复运行更是每次全新，挂实例等于每几十个请求就把窗口清零，顶上那句
+    「200 请求 / 5 分钟」就成了空话。ctx 为 None（测试、一次性脚本）时退回实例级。
+    """
 
     def __init__(self, ctx=None, quota=RATE_QUOTA):
         self._ctx = ctx
         self._quota = quota
-        self._stamps = deque()
+        session = getattr(ctx, 'session', None)
+        self._stamps = (deque() if session is None
+                        else session.setdefault(RATE_KEY, deque()))
         self.requests = 0
 
     # ---------- 取消与限流 ----------
