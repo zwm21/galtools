@@ -110,6 +110,11 @@ def extract_mjo(path):
             has_text = True
             i += ln + 2
         elif cmd == AdvEvent:
+            # 末尾几个字节上恰好是 0x842 时，下面两次 unpack_from 会越过缓冲区，
+            # 把整个文件废成「解析失败」——已经提取出的几千条文本一起丢掉。主循环
+            # 本来就刻意漏掉最后一个 opcode，这里同样当这截残字节不存在。
+            if i + 6 > script_len:
+                break
             i += 2
             if struct.unpack_from('<H', script, i)[0] == AdvEvtType:
                 i += 2
@@ -191,9 +196,14 @@ def preview(params, ctx):
 
 def run(params, ctx):
     src_dir, out_dir, merged_path = resolve_paths(params)
+    files = list_mjo(src_dir)
+    if not files:
+        # 一个文件都没有时绝不碰合并全文：它很可能是上一次的成果，而下面那个
+        # 'w' 会把它清成空文件。GUI 靠 preview 的 ok=False 挡住这种情况，命令行
+        # 直接调 run，没有那道闸。
+        return RunResult(summary='%s 里没有 .mjo 文件，什么都没做。' % src_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    files = list_mjo(src_dir)
     total_lines = 0
     merged = []
     failed = []

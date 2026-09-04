@@ -163,6 +163,15 @@ def test_last_opcode_at_boundary_is_dropped(tmp_path):
     assert lines_of(tmp_path, kept + dropped) == ['残る', '消える']
 
 
+def test_adv_event_at_the_very_end_does_not_kill_the_file(tmp_path):
+    """末尾几字节上的 0x842 曾让 unpack_from 越界，把整份文本一起废掉。"""
+    kept = show_text('残る') + dialog_close()
+    path = tmp_path / 'a.mjo'
+    # 尾巴上只留 AdvEvent + 类型码，第三个 u16 缺席
+    path.write_bytes(build_mjo(kept + struct.pack('<HH', 0x842, 0x002)))
+    assert extract_mjo(str(path)) == ['残る']
+
+
 # ---------------- 路径推导 ----------------
 def test_out_dir_defaults_under_source():
     src, out, merged = resolve_paths({'src_dir': r'X:\game\scenario.arc~'})
@@ -204,13 +213,18 @@ def test_run_writes_txt_without_trailing_newline(tmp_path):
     assert '【a】' in merged
 
 
-def test_run_writes_merged_even_with_no_input(tmp_path):
-    """合并全文无条件写出，哪怕一个文件都没有。"""
+def test_run_leaves_the_merged_text_alone_when_there_is_no_input(tmp_path):
+    """空目录不能把上一次的合并全文清成空文件——命令行没有预览那道闸。"""
     src = tmp_path / 'src'
     src.mkdir()
-    out = tmp_path / 'out'
-    run({'src_dir': str(src), 'out_dir': str(out)}, RunContext())
-    assert (tmp_path / MERGED_NAME).read_text(encoding='utf-8') == ''
+    merged = tmp_path / MERGED_NAME
+    merged.write_text('上一次的成果', encoding='utf-8')
+    result = run({'src_dir': str(src), 'out_dir': str(tmp_path / 'out')},
+                 RunContext())
+    assert merged.read_text(encoding='utf-8') == '上一次的成果'
+    assert '没有 .mjo 文件' in result.summary
+    assert result.output_paths == []
+    assert not (tmp_path / 'out').exists()     # 连输出目录都不建
 
 
 def test_run_collects_per_file_failures(tmp_path):
