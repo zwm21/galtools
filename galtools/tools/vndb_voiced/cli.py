@@ -95,15 +95,20 @@ def main():
         raw = ask_targets()
 
     ctx = ConsoleContext()
-    print(run({'staff': raw, 'out_dir': args.output,
-               'refresh': args.refresh}, ctx).summary)
+    result = run({'staff': raw, 'out_dir': args.output,
+                  'refresh': args.refresh}, ctx)
+    print(result.summary)
+    # 一个文件都没写出来时以非零退出。ApiError 那条路径本来就这样，而「目标全都
+    # 定位不到人」「输出目录不可用」同样是什么都没产出，exit 0 会让调用它的脚本
+    # 把这些当成成功。
+    return 0 if result.output_paths else 1
 
 
 if __name__ == '__main__':
     # 双击运行（无参数）时才在结束前暂停，带参数的调用要能进脚本管道。
     interactive = len(sys.argv) == 1
     try:
-        main()
+        code = main()
     except KeyboardInterrupt:
         print('\n\n[!] 用户中断（Ctrl+C），已退出。没有写出文件。')
         if interactive:
@@ -119,3 +124,4 @@ if __name__ == '__main__':
         sys.exit(1)
     if interactive:
         pause_any_key()
+    sys.exit(code)

@@ -15,6 +15,7 @@ from email.message import Message
 import pytest
 
 from galtools.core.context import Cancelled, RunContext
+from galtools.core.spec import RunResult
 from galtools.tools import vndb_voiced as tool
 from galtools.tools.vndb_voiced import api, cli, fetch, xlsx
 from galtools.tools.vndb_voiced.model import (
@@ -1289,3 +1290,14 @@ def test_cli_shares_the_person_cap_with_the_gui():
     assert cli.check_targets(ok) == (fetch.parse_targets(ok), '')
     targets, error = cli.check_targets(ok + ', s99')
     assert targets == [] and '最多 %d 个人' % tool.MAX_TARGETS in error
+
+
+def test_cli_exit_code_says_whether_anything_was_written(monkeypatch, tmp_path):
+    """什么都没写出来就得非零退出：目标全都定位不到人、输出目录不可用这些以前
+    也是 exit 0，脚本没法与成功区分。"""
+    monkeypatch.setattr(cli.sys, 'argv', ['cli', 's1', '-o', str(tmp_path)])
+    monkeypatch.setattr(cli, 'run', lambda params, ctx: RunResult(summary='空手'))
+    assert cli.main() == 1
+    monkeypatch.setattr(cli, 'run', lambda params, ctx: RunResult(
+        summary='好了', output_paths=[str(tmp_path / 'x.xlsx')]))
+    assert cli.main() == 0
