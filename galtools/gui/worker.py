@@ -4,8 +4,10 @@
 用标准库 threading.Thread 而非 QThread：已实测普通线程里 emit 信号能正常
 跨线程投递，这样就不必操心 QThread 的对象归属与生命周期。
 
-预览与执行串行进行——新请求先取消并等待旧线程退出。工具侧只在扫描完成时
-一次性写入 ctx.session，被取消的预览到不了那一步，所以两者不会争抢缓存。
+预览与执行串行进行——新请求先取消旧线程再等它退出。等待有上限（JOIN_TIMEOUT），
+卡在一个网络请求里的旧线程可能活过这次等待，所以正确性不能只靠这个 join：每份活
+带一个编号，编号过期后它发的日志、进度与结果一律丢弃，否则上一轮的进度条和日志会
+插到下一轮里。工具侧也只在扫描完成时一次性写 ctx.session，被取消的活到不了那一步。
 """
 import threading
 import time
@@ -17,6 +19,10 @@ from ..core.context import Cancelled, RunContext
 
 # 进度信号合流间隔：逐文件 emit 上千次会把日志控件拖死。
 PROGRESS_INTERVAL = 0.1
+# 等旧线程退出的上限。这是在界面线程上等的，所以宁短勿长——工具在循环里
+# check_cancel，正常情况几毫秒就退出；真卡在 socket 上的那种等多久都没用，
+# 交给上面说的活计编号兜住。
+JOIN_TIMEOUT = 1.0
 
 
 def emit(signal, *args):
@@ -43,16 +49,24 @@ class Bridge(QObject):
 
 
 class GuiContext(RunContext):
-    def __init__(self, bridge, cancel_event, session):
+    def __init__(self, bridge, cancel_event, session, alive=None):
         super().__init__(session)
         self._bridge = bridge
         self._cancel = cancel_event
+        self._alive = alive
         self._last_emit = 0.0
 
+    def _superseded(self):
+        return self._alive is not None and not self._alive()
+
     def log(self, msg, level='info'):
+        if self._superseded():
+            return
         emit(self._bridge.log, msg, level)
 
     def progress(self, done, total, note=''):
+        if self._superseded():
+            return
         now = time.monotonic()
         # 最后一次必须送达，中间的按间隔丢弃。
         if done < total and now - self._last_emit < PROGRESS_INTERVAL:
@@ -71,6 +85,7 @@ class JobRunner:
         self._thread = None
         self._cancel = threading.Event()
         self._preview_gen = 0
+        self._job = 0
 
     @property
     def busy(self):
@@ -84,13 +99,23 @@ class JobRunner:
         （超时溜过去的那种由上面的 emit 兜住）。"""
         self._stop_current()
 
-    def _stop_current(self, timeout=5.0):
+    def _stop_current(self, timeout=JOIN_TIMEOUT):
         """取消在跑的活并等它退出。工具在循环里 check_cancel，退出很快。"""
         if self.busy:
             self._cancel.set()
             self._thread.join(timeout)
         self._cancel = threading.Event()
         self._thread = None
+        # 上一份活从此说什么都不算——它可能还卡在 socket 上没醒。
+        self._job += 1
+
+    def _context(self, session, job):
+        return GuiContext(self.bridge, self._cancel, session,
+                          alive=lambda: self._job == job)
+
+    def _emit(self, job, signal, *args):
+        if job == self._job:
+            emit(signal, *args)
 
     def _spawn(self, target):
         self._thread = threading.Thread(target=target, daemon=True)
@@ -100,20 +125,21 @@ class JobRunner:
         self._stop_current()
         self._preview_gen += 1
         gen = self._preview_gen
-        ctx = GuiContext(self.bridge, self._cancel, session)
+        job = self._job
+        ctx = self._context(session, job)
 
-        def job():
+        def run_preview():
             try:
                 result = spec.preview(params, ctx)
             except Cancelled:
                 return
             except Exception as e:
-                emit(self.bridge.preview_failed, gen,
-                     '%s: %s' % (type(e).__name__, e))
+                self._emit(job, self.bridge.preview_failed, gen,
+                           '%s: %s' % (type(e).__name__, e))
                 return
-            emit(self.bridge.preview_ready, gen, result)
+            self._emit(job, self.bridge.preview_ready, gen, result)
 
-        self._spawn(job)
+        self._spawn(run_preview)
         return gen
 
     def is_current_preview(self, gen):
@@ -121,17 +147,19 @@ class JobRunner:
 
     def start_run(self, spec, params, session):
         self._stop_current()
-        ctx = GuiContext(self.bridge, self._cancel, session)
+        job = self._job
+        ctx = self._context(session, job)
 
-        def job():
+        def do_run():
             try:
                 result = spec.run(params, ctx)
             except Cancelled as c:
-                emit(self.bridge.run_cancelled, getattr(c, 'partial', None))
+                self._emit(job, self.bridge.run_cancelled,
+                           getattr(c, 'partial', None))
                 return
             except Exception:
-                emit(self.bridge.run_failed, traceback.format_exc())
+                self._emit(job, self.bridge.run_failed, traceback.format_exc())
                 return
-            emit(self.bridge.run_finished, result)
+            self._emit(job, self.bridge.run_finished, result)
 
-        self._spawn(job)
+        self._spawn(do_run)
