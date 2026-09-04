@@ -313,6 +313,8 @@ def ensure_credits(staffs, ctx, client=None):
 
     failures 是 [(人名, 原因)]：某一个人抓失败不该连累别人，所以按人捕获
     ApiError；Cancelled 是 BaseException，会照常穿透并且不留下半份缓存。
+    有人失败时整份结果也不进缓存，否则用户再点一次「开始」只会拿回同一份残缺
+    结果——那正是他想重试的时候。
 
     进度条要横跨所有人，因此先各要一次 count 算出总量（每人一次便宜请求，
     换一个确定进度；这些 count 本来预览就已经缓存过了）。count 也可能失败，
@@ -348,7 +350,11 @@ def ensure_credits(staffs, ctx, client=None):
             ctx.log('  %d 部作品 / %d 个角色' % (len(set(c.vid for c in credits)),
                                             len(credits)))
         base += totals[staff.sid]
-    ctx.session['credits'] = (key, (items, failures))
+    if not failures:
+        # 只缓存完整的成功。抖一次网就把残缺结果缓存住的话，用户再点一次
+        # 「开始」是零请求、同一份残缺结果、再多一个 _1 文件，除非他想到去勾
+        # 「重新抓取」。ensure_counts 的口径也是只有成功才落缓存。
+        ctx.session['credits'] = (key, (items, failures))
     return items, failures
 
 
