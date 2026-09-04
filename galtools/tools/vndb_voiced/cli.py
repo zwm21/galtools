@@ -11,7 +11,7 @@ import argparse
 import sys
 
 from ...core.context import ConsoleContext
-from . import api, fetch, run
+from . import api, fetch, run, validate
 
 BASE = 'https://vndb.org/'
 DEFAULT_TARGET = 's367'
@@ -27,14 +27,18 @@ def setup_console():
 
 
 def check_targets(raw):
-    """返回 (目标列表, 错误消息)。判断规则与 GUI 的 validate 同源。"""
+    """返回 (目标列表, 错误消息)。
+
+    规则不自己写一份，直接调 ToolSpec.validate：人数上限这类规则以前只装在 GUI
+    那一侧，命令行喂 20 个 id 会一路跑到抓完再去枚举一百万个组合。out_dir 不传，
+    validate 里那条目录检查就自动跳过——命令行的输出目录由 save 现建。
+    """
     targets = fetch.parse_targets(raw)
     if not targets:
         return [], '没解析出任何目标。'
-    for target in targets:
-        kind, value = fetch.classify(target)
-        if kind == 'bad':
-            return [], value
+    for key, message in validate({'staff': raw}):
+        if key == 'staff':
+            return [], message
     return targets, ''
 
 
