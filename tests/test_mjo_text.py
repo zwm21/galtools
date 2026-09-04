@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """mjo 提取的纯逻辑测试。
 
-用手工拼的最小 MajiroObjV1 当输入：入口表项数取 1，此时 header_len 恰好
-等于硬编码的 BYTECODE_BEGIN(0x28)，测试才能不受那个已知缺陷干扰。
+用手工拼的最小 MajiroObjV1 当输入。入口表项数默认取 1，此时 header_len 恰好是
+0x28；count 取别的值时字节码起点跟着后移，`test_entry_table_is_not_scanned`
+钉的就是这一点。
 """
 import os
 import struct
@@ -11,7 +12,7 @@ import pytest
 
 from galtools.core.context import Cancelled, RunContext
 from galtools.tools.mjo_text import (
-    MERGED_NAME, extract_mjo, resolve_paths, run,
+    MERGED_NAME, extract_mjo, is_valid_str, resolve_paths, run,
 )
 
 V1 = b'MajiroObjV1.000\x00'
@@ -170,6 +171,28 @@ def test_adv_event_at_the_very_end_does_not_kill_the_file(tmp_path):
     # 尾巴上只留 AdvEvent + 类型码，第三个 u16 缺席
     path.write_bytes(build_mjo(kept + struct.pack('<HH', 0x842, 0x002)))
     assert extract_mjo(str(path)) == ['残る']
+
+
+def test_entry_table_is_not_scanned(tmp_path):
+    """count != 1 时字节码从 header_len 起步，入口函数表不再被当字节码扫。
+
+    入口表里塞一段合法的 ShowText，位置正好是旧代码硬编码的起点 0x28：按
+    header_len 起步看不见它，按 0x28 起步会把它当台词扫出来。
+    """
+    count = 3                                  # header_len = 0x18+24+4+4 = 0x38
+    bait = show_text('あい')                    # 9 字节，塞得进表尾的 12 字节
+    table = bytearray(b'\x00' * 24)
+    table[0x28 - 0x1C:0x28 - 0x1C + len(bait)] = bait
+    bytecode = show_text('本物のセリフ') + dialog_close() + PAD
+    data = (bytes(V1.ljust(0x18, b'\x00')) + struct.pack('<I', count)
+            + bytes(table) + struct.pack('<I', len(bytecode)) + bytecode)
+    path = tmp_path / 'a.mjo'
+    path.write_bytes(data)
+
+    # 先证明这段饵真的会被旧起点扫到，否则这条测试没有牙
+    assert struct.unpack_from('<H', data, 0x28)[0] == 0x840
+    assert is_valid_str(data, 0x2A)
+    assert extract_mjo(str(path)) == ['本物のセリフ']
 
 
 # ---------------- 路径推导 ----------------

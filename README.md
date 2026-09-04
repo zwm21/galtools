@@ -28,6 +28,8 @@ python -m galtools.tools.mjo_text <.mjo 目录> [输出目录]
 
 输出目录留空时为 `<.mjo 目录>/script_text`。目录里一个 `.mjo` 都没有时什么都不做——合并全文往往是上一次的成果，`'w'` 打开就会把它清成空文件，而命令行没有预览那道闸。
 
+字节码起点按头部算出的 `header_len` 而不是硬编码的 `0x28`：入口函数表项数为 1 时两者相等（剧情脚本几乎都是），不为 1 的那些 UI 脚本原先会把入口表当字节码扫出乱码。
+
 **语音时长筛选**（`galtools/tools/audio_filter/`）按时长区间把语音复制到源目录下的新文件夹，并生成复制清单。不解码音频，直接读 WAV 的 RIFF 头与 Ogg 的 granule position。
 
 ```
