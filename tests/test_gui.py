@@ -124,3 +124,11 @@ def test_a_drive_root_keeps_its_separator():
     assert normalize_path('E:/') == 'E:' + os.sep
     assert normalize_path('e:') == 'e:' + os.sep
     assert normalize_path('') == ''
+    assert normalize_path('E:\\voice\\\\') == 'E:\\voice'
+    assert normalize_path('..\\out\\') == '..\\out'
+    # UNC 共享根不受影响：剥掉尾分隔符后仍指向共享本身（它的 dirname 是自己）。
+    assert normalize_path('\\\\server\\share\\') == '\\\\server\\share'
+    # 只有分隔符的输入会被剥成空串，于是当作「没填」——必填校验会拦下来，
+    # 不填必填字段本来也走不下去。既有行为，原样记着。
+    assert normalize_path('\\\\') == ''
+    assert normalize_path('/') == ''

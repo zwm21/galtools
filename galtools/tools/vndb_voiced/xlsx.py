@@ -10,6 +10,7 @@ ref 至少含一行数据，只有表头的 ref 会让文件被判定为损坏�
 """
 import os
 import re
+from ...core.paths import keep_drive_root
 from .model import ROLES, url_for
 
 # 每人一页的列。前 8 列沿用旧脚本的表头与列宽（Title1/Cast1/As1 是原名，原名本就
@@ -314,10 +315,15 @@ def target_dir(target):
     """save 会把工作簿写进哪个目录。
 
     工具层在**抓取之前**拿它先建一次目录：抓完几分钟才发现盘不存在，那几分钟
-    就白等了。算目录的规则因此只有这一份，否则先挡下的地方和真正写入的地方
-    可能不是同一个。
+    就白等了。save 也调它算目录，所以先挡下的地方和真正写入的地方一定是同一个。
+
+    名字以 .xlsx 结尾的**目录**会被当成文件路径，工作簿落到它的父目录而不是它
+    里面（带不带尾分隔符只影响文件名：不带就沿用 foo.xlsx，带了就退回
+    workbook_name）。既有行为，这里只记着。
+
+    abspath 之前先补盘符：`-o E:` 的 abspath 是 E 盘的当前工作目录而不是根目录。
     """
-    target = os.path.abspath(target or '.')
+    target = os.path.abspath(keep_drive_root(target or '.'))
     if target.lower().endswith('.xlsx'):
         return os.path.dirname(target) or '.'
     return target

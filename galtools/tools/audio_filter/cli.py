@@ -10,6 +10,7 @@ import os
 import sys
 
 from ...core.context import ConsoleContext
+from ...core.paths import keep_drive_root
 from . import core
 from . import run
 
@@ -31,7 +32,7 @@ def setup_console():
 def ask_directory():
     while True:
         raw = input('请输入语音文件所在目录（可直接拖拽文件夹到此）: ').strip()
-        raw = raw.strip('"').strip("'").rstrip('\\/').strip()
+        raw = keep_drive_root(raw.strip('"').strip("'").rstrip('\\/').strip())
         if not raw:
             print('  [!] 目录不能为空，请重新输入。')
             continue

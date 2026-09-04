@@ -38,6 +38,7 @@ import struct
 import sys
 
 from ..core.context import RunContext
+from ..core.paths import keep_drive_root
 from ..core.spec import DIR, Field, PreviewResult, RunResult, ToolSpec
 
 ShowText = 0x840
@@ -168,11 +169,18 @@ def resolve_paths(params):
 
     合并全文的落点沿用原脚本写法，包含输出目录为相对路径时退化到当前工作
     目录这一行为——它是既有产出的一部分，不能顺手改成 pathlib。
+
+    只剩盘符的写法要补回分隔符（见 core.paths.keep_drive_root），三处都要过：
+    `src_dir='E:'` 会去列 E 盘当前目录的文件；`out_dir='E:'` 让单文件 txt 落成
+    `E:xxx.txt` 这种驱动器相对路径；而剥掉尾分隔符再取 dirname 又会把已经补好的
+    `E:\\` 打回 `E:`。
     """
-    src_dir = params.get('src_dir') or '.'
-    out_dir = params.get('out_dir') or os.path.join(src_dir, 'script_text')
-    merged_path = os.path.join(
-        os.path.dirname(out_dir.rstrip('/\\')) or '.', MERGED_NAME)
+    src_dir = keep_drive_root(params.get('src_dir') or '.')
+    out_dir = (keep_drive_root(params.get('out_dir') or '')
+               or os.path.join(src_dir, 'script_text'))
+    parent = keep_drive_root(
+        os.path.dirname(keep_drive_root(out_dir.rstrip('/\\'))))
+    merged_path = os.path.join(parent or '.', MERGED_NAME)
     return src_dir, out_dir, merged_path
 
 

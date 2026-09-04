@@ -964,6 +964,16 @@ def test_target_dir_agrees_with_where_save_writes(tmp_path):
         == xlsx.target_dir(str(target))
 
 
+def test_a_bare_drive_letter_means_the_root_not_the_drives_cwd(monkeypatch,
+                                                              tmp_path):
+    """`-o E:` 以前会写到 E 盘的当前工作目录去。abspath 拦不住，得先补分隔符。"""
+    monkeypatch.chdir(tmp_path)
+    drive = os.path.splitdrive(str(tmp_path))[0]
+    # 先证明这条测试有牙：cwd 落在该盘上时，裸盘符的 abspath 就是 cwd。
+    assert os.path.abspath(drive) == str(tmp_path)
+    assert xlsx.target_dir(drive) == drive + os.sep
+
+
 def test_clean_strips_control_chars():
     assert xlsx.clean('a\x01b\nc') == 'ab\nc'
     assert xlsx.clean(5) == 5

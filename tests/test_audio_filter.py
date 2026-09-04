@@ -343,6 +343,21 @@ def test_describe_condition():
     assert core.describe_condition(7.0, 9.0) == '7 秒 < 时长 <= 9 秒'
 
 
+# ---------------- 命令行向导 ----------------
+def test_wizard_reads_a_bare_drive_letter_as_the_root(monkeypatch, tmp_path):
+    """向导的 isdir 对裸盘符也为真，于是 `E:` 会去扫 E 盘的当前工作目录。"""
+    from galtools.tools.audio_filter import cli
+
+    monkeypatch.chdir(tmp_path)
+    drive = os.path.splitdrive(str(tmp_path))[0]
+    assert os.path.abspath(drive) == str(tmp_path)      # 证明这条测试有牙
+
+    monkeypatch.setattr(cli, 'input', lambda _: ' "%s" ' % drive, raising=False)
+    monkeypatch.setattr(os.path, 'isdir', lambda p: True)
+    assert cli.ask_directory() == drive + os.sep
+
+
+
 # ---------------- 复制与取消 ----------------
 def test_copy_hits_keeps_partial_work_on_cancel(tmp_path):
     src = tmp_path / 'src'
