@@ -307,6 +307,19 @@ def _combo_index(wb, items, planned, title, tname, font):
 
 
 # ---------------- 入口 ----------------
+def target_dir(target):
+    """save 会把工作簿写进哪个目录。
+
+    工具层在**抓取之前**拿它先建一次目录：抓完几分钟才发现盘不存在，那几分钟
+    就白等了。算目录的规则因此只有这一份，否则先挡下的地方和真正写入的地方
+    可能不是同一个。
+    """
+    target = os.path.abspath(target or '.')
+    if target.lower().endswith('.xlsx'):
+        return os.path.dirname(target) or '.'
+    return target
+
+
 def build(items, combos, path):
     """写出工作簿，返回 path。
 
@@ -355,10 +368,10 @@ def build(items, combos, path):
 
 def save(items, combos, target):
     """target 可以是目录也可以是 .xlsx 路径。返回实际写入的路径。"""
-    target = os.path.abspath(target or '.')
-    if target.lower().endswith('.xlsx'):
-        directory, name = os.path.dirname(target), os.path.basename(target)
+    directory = target_dir(target)
+    if (target or '').lower().endswith('.xlsx'):
+        name = os.path.basename(target)
     else:
-        directory, name = target, workbook_name([i.staff for i in items])
-    os.makedirs(directory or '.', exist_ok=True)
+        name = workbook_name([i.staff for i in items])
+    os.makedirs(directory, exist_ok=True)
     return build(items, combos, unique_path(os.path.join(directory, name)))
