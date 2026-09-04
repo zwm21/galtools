@@ -1135,6 +1135,53 @@ def test_run_refuses_a_bad_output_dir_before_spending_a_request(monkeypatch,
     assert fake.calls == []                        # 一个请求都没打出去
 
 
+def test_run_takes_back_the_directory_it_made_when_it_wrote_nothing(monkeypatch,
+                                                                   tmp_path):
+    """一无所获时不该在盘上留个空壳。预检为了早点挡下坏路径会先把目录建出来，
+    而「定位不到人」「每个人都抓失败」「取消」这几个出口都不写文件。"""
+    fake = FakeApi(vndb()).install(monkeypatch)
+    fresh = tmp_path / 'brand_new'
+    result = tool.run({'staff': 's9', 'out_dir': str(fresh)}, RunContext())
+
+    assert result.output_paths == []
+    assert not fresh.exists()
+    assert len(fake.calls) == 1                    # 只花了定位那一个请求
+
+
+def test_run_takes_back_the_directory_on_cancel_too(monkeypatch, tmp_path):
+    """Cancelled 是 BaseException，收尾得放在 finally 里才拦得住它。"""
+    FakeApi(vndb()).install(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise Cancelled()
+
+    monkeypatch.setattr(fetch, 'ensure_credits', boom)
+    fresh = tmp_path / 'brand_new'
+    with pytest.raises(Cancelled):
+        tool.run({'staff': 's1', 'out_dir': str(fresh)}, RunContext())
+    assert not fresh.exists()
+
+
+def test_run_never_touches_a_directory_that_was_already_there(monkeypatch,
+                                                             tmp_path):
+    """只收自己建的那一个。用户本来就有的目录哪怕是空的也不许动——它可能是刚
+    建好准备放东西的地方。"""
+    FakeApi(vndb()).install(monkeypatch)
+    mine = tmp_path / 'mine'
+    mine.mkdir()
+    tool.run({'staff': 's9', 'out_dir': str(mine)}, RunContext())
+    assert mine.is_dir()
+
+
+def test_run_keeps_the_directory_when_the_workbook_lands_in_it(monkeypatch,
+                                                              tmp_path):
+    pytest.importorskip('openpyxl')
+    FakeApi(vndb()).install(monkeypatch)
+    fresh = tmp_path / 'brand_new'
+    result = tool.run({'staff': 's1', 'out_dir': str(fresh)}, RunContext())
+    assert fresh.is_dir() and os.path.exists(result.output_paths[0])
+
+
 def test_run_reports_a_write_failure_instead_of_a_traceback(monkeypatch,
                                                             tmp_path):
     """抓完了才写不出去（盘满、路径过长、文件被 Excel 占着）：OSError 不能穿到

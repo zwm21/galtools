@@ -204,17 +204,35 @@ def preview(params, ctx):
 
 
 def run(params, ctx):
-    """命令行从不预览，所以 run 自己也要解析目标、自己也要抓。"""
-    _apply_refresh(params, ctx)
+    """先把输出目录备好再抓，一无所获时把自己建的那个目录收回去。"""
     out_dir = params.get('out_dir')
+    target = xlsx.target_dir(out_dir)
+    # 抓之前先把目录建出来。GUI 侧 validate 已经拦过一道，命令行的 -o 没人拦：
+    # 实测 -o Z:\nope\deeper 是在打完 5 个请求之后才炸的，几分钟的抓取白费。
+    already = os.path.isdir(target)
     try:
-        # 抓之前先把目录建出来。GUI 侧 validate 已经拦过一道，命令行的 -o 没人
-        # 拦：实测 -o Z:\nope\deeper 是在打完 5 个请求之后才炸的，几分钟的抓取
-        # 白费。
-        os.makedirs(xlsx.target_dir(out_dir), exist_ok=True)
+        os.makedirs(target, exist_ok=True)
     except OSError as e:
         return RunResult(summary='\n输出目录不可用，没有抓取：%s' % e,
                          failures=[('输出目录', str(e))])
+    try:
+        return _run(params, ctx, out_dir)
+    finally:
+        # 五个出口都从这里过，包括 Cancelled（它是 BaseException）。目录是我们刚
+        # 建的才收回去——不然「定位不到人」「取消」这些一无所获的结局会在盘上留个
+        # 空壳。写出了工作簿的那次不必另加判断：rmdir 本身就拒绝删非空目录。
+        # 只收叶子那一级：深路径 -o a\b\c 建了三层时 a\b 会留下，而 removedirs
+        # 会往上爬进用户本来就有的空目录，不能用。
+        if not already:
+            try:
+                os.rmdir(target)
+            except OSError:
+                pass
+
+
+def _run(params, ctx, out_dir):
+    """命令行从不预览，所以 run 自己也要解析目标、自己也要抓。"""
+    _apply_refresh(params, ctx)
     try:
         resolutions = fetch.ensure_resolved(params, ctx)
     except api.ApiError as e:
