@@ -18,7 +18,8 @@ from galtools.core.context import Cancelled, RunContext
 from galtools.tools import vndb_voiced as tool
 from galtools.tools.vndb_voiced import api, cli, fetch, xlsx
 from galtools.tools.vndb_voiced.model import (
-    Common, Credit, Staff, StaffCredits, label, released_sort_key, url_for,
+    Common, Credit, Resolution, Staff, StaffCredits, label, released_sort_key,
+    url_for,
 )
 
 
@@ -1097,6 +1098,79 @@ def test_run_writes_every_combination_for_three_people(monkeypatch, tmp_path):
     assert result.table.columns == ('发售日', 'Title', '日文原名',
                                     'Alpha One', 'Beta Two', 'Gamma Three')
     assert result.table.title == '共同出演 1 部'
+
+
+def test_same_person_named_twice_is_merged(monkeypatch, tmp_path):
+    """`s1, Alpha One` 指向同一个人：抓一遍、一页明细，不出「他和他自己」那张表。"""
+    pytest.importorskip('openpyxl')
+    from openpyxl import load_workbook
+
+    fake = FakeApi(vndb()).install(monkeypatch)
+    result = tool.run({'staff': 's1, Alpha One', 'out_dir': str(tmp_path)},
+                      RunContext())
+    assert os.path.basename(result.output_paths[0]) == 'vndb_Alpha_One_voiced.xlsx'
+    wb = load_workbook(result.output_paths[0])
+    assert wb.sheetnames == ['概览', 'アルファ s1']
+    assert '1 个目标指向同一个人，已合并。' in result.warnings
+
+    # 抓取次数与只填一次时一致，不再白打一倍
+    once = FakeApi(vndb()).install(monkeypatch)
+    tool.run({'staff': 's1', 'out_dir': str(tmp_path)}, RunContext())
+    resolve_calls = len([c for c in fake.calls if c[0] == 'staff'])
+    assert len([c for c in fake.calls if c[0] != 'staff']) == \
+        len([c for c in once.calls if c[0] != 'staff'])
+    assert resolve_calls > len([c for c in once.calls if c[0] == 'staff'])
+
+
+def test_preview_merges_the_duplicate_and_says_so(monkeypatch, tmp_path):
+    FakeApi(vndb()).install(monkeypatch)
+    result = tool.preview({'staff': 's1, Alpha One', 'out_dir': str(tmp_path)},
+                          RunContext())
+    assert result.ok
+    assert result.summary.splitlines() == [
+        'アルファ (Alpha One) s1：角色 2，作品 ≤2',
+        '共 1 人，预计 约 5 秒；输出 vndb_Alpha_One_voiced.xlsx']
+    assert '有 1 个目标指向同一个人，已合并。' in result.warnings
+    assert len(result.table.rows) == 1
+
+
+def test_api_errors_are_shown_as_a_sentence_not_a_traceback(monkeypatch, tmp_path):
+    """ApiError 是「已翻译成人话的失败」，穿到 worker 那层会变成一段红色的栈。"""
+    FakeApi(lambda path, body, nth: http_error(500, b'down')).install(monkeypatch)
+    preview = tool.preview({'staff': 's1', 'out_dir': str(tmp_path)}, RunContext())
+    assert not preview.ok
+    assert preview.summary.startswith('vndb 接口出错：')
+    assert 'HTTP 500' in preview.summary
+
+    result = tool.run({'staff': 's1', 'out_dir': str(tmp_path)}, RunContext())
+    assert result.output_paths == []
+    assert 'vndb 接口出错' in result.summary
+    assert [n for n, _ in result.failures] == ['vndb 接口']
+
+
+def test_result_table_falls_back_to_the_first_non_empty_combo(monkeypatch,
+                                                              tmp_path):
+    """三人以上全员没有交集时，原先固定摆全员那一档，屏幕上一片空白。"""
+    pytest.importorskip('openpyxl')
+    staffs = [Staff(sid='s%d' % i, name='N%d S%d' % (i, i)) for i in (1, 2, 3)]
+    items = [person('s1', [credit('v1', 'a', 'c1')]),
+             person('s2', [credit('v1', 'b', 'c2'), credit('v2', 'b', 'c3')]),
+             person('s3', [credit('v2', 'c', 'c4')])]
+    for item, staff in zip(items, staffs):
+        item.staff = staff
+    monkeypatch.setattr(fetch, 'ensure_resolved',
+                        lambda params, ctx, client=None:
+                        [Resolution(target=s.sid, staff=s) for s in staffs])
+    monkeypatch.setattr(fetch, 'ensure_credits',
+                        lambda ss, ctx, client=None: (items, []))
+
+    result = tool.run({'staff': 's1, s2, s3', 'out_dir': str(tmp_path)},
+                      RunContext())
+    assert '共同出演 : 2 个组合有交集（共 4 个组合）' in result.summary
+    assert result.table.title == 'N1 S1、N2 S2 共同出演 1 部'
+    assert result.table.columns == ('发售日', 'Title', '日文原名',
+                                    'N1 S1', 'N2 S2')
+    assert len(result.table.rows) == 1
 
 
 # ---------------- 命令行 ----------------
