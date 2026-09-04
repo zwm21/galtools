@@ -122,14 +122,20 @@ def parse_wav_duration(path):
 
 
 def get_duration(path):
-    """按扩展名分发，返回时长（秒）或 None。"""
+    """按扩展名分发，返回时长（秒）或 None。
+
+    struct.error 与 OSError 一样要接住：ogg 那条路径在文件被截断到几十字节时会
+    在 head[o+10:o+12] 这类切片上抛 struct.error，而调用方 scan_audio_files 没有
+    try——一个坏文件就会掀掉整次扫描，连同已经解析好的几千个文件的结果。wav 那条
+    路径本来就接了（parse_wav_duration 的 except），两边现在对称。
+    """
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext == '.ogg':
             return parse_ogg_duration(path)
         if ext == '.wav':
             return parse_wav_duration(path)
-    except OSError:
+    except (OSError, struct.error):
         return None
     return None
 
