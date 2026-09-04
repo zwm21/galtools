@@ -149,10 +149,13 @@ def combo_label(staffs):
 
 
 def table_name(used, base):
-    """表名在工作簿内必须唯一，且不区分大小写。
+    """表名在工作簿内必须唯一，且不区分大小写——重名同样会让 Excel 判定文件损坏，
+    与工作表重名不是一回事，得各自去重。
 
-    同一个人填两次（`s367, Ono Ryouko`）就会走到重名这一支——重名同样会让
-    Excel 判定文件损坏，和工作表重名不是一回事，得各自去重。
+    工具层现在已经先按 sid 合并了重复的人，而这里每个 base 都由 sid 派生
+    （`Staff_s367`、`Common_s367_s131`），所以加序号那一支只有直接调 build 时才
+    走得到——test_same_person_twice_still_gets_unique_table_names 就是那么调的。
+    留着它是因为 build 是公开入口，不该假定调用方已经去过重。
     """
     name = base
     i = 2

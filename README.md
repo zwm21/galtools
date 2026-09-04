@@ -16,7 +16,7 @@ python run_gui.py
 pip install -r requirements.txt
 ```
 
-`galtools/core/` 只用标准库，工具也不在 import 期碰第三方库（openpyxl 一律在函数内 import）。因此没装 PySide6 时 GUI 起不来但命令行照常可用，没装 openpyxl 时工具列表照常列出——两点都有测试钉住。
+`galtools/core/` 只用标准库，工具也不在 import 期碰第三方库（openpyxl 一律在函数内 import）。因此没装 PySide6 时 GUI 起不来但命令行照常可用，没装 openpyxl 时工具列表照常列出——两点都有测试钉住，`requirements.txt` 里也逐行注明了哪个依赖是给谁的。
 
 ## 现有工具
 
@@ -28,7 +28,7 @@ python -m galtools.tools.mjo_text <.mjo 目录> [输出目录]
 
 输出目录留空时为 `<.mjo 目录>/script_text`。目录里一个 `.mjo` 都没有时什么都不做——合并全文往往是上一次的成果，`'w'` 打开就会把它清成空文件，而命令行没有预览那道闸。
 
-字节码起点按头部算出的 `header_len` 而不是硬编码的 `0x28`：入口函数表项数为 1 时两者相等（剧情脚本几乎都是），不为 1 的那些 UI 脚本原先会把入口表当字节码扫出乱码。
+字节码起点按头部算出的 `header_len` 而不是硬编码的 `0x28`：入口函数表项数为 1 时两者相等（剧情脚本几乎都是），不为 1 的那些 UI 脚本旧起点会从入口表中间起步。但实测两部作品共 306 个脚本、其中 60 个项数不为 1，两种起点的提取结果逐条相同——入口表里的字节极少凑成文本 opcode，凑成了也过不了校验，逐字节步进会在遇到真 opcode 之前重新对齐。所以这不是一个曾经产出乱码的 bug，改它只是为了不依赖这种巧合；对账脚本是 `tests/manual/mjo_offset_diff.py`。
 
 **语音时长筛选**（`galtools/tools/audio_filter/`）按时长区间把语音复制到源目录下的新文件夹，并生成复制清单。不解码音频，直接读 WAV 的 RIFF 头与 Ogg 的 granule position。
 
@@ -51,6 +51,8 @@ python -m galtools.tools.vndb_voiced.cli [目标...] [-o 输出目录或 .xlsx]
 目标可以是 id（`s367`）、声优页网址或名字，多个用逗号分隔；不带参数则进入交互模式。名字有歧义时不会替你猜，而是列出候选各自的主名并要求改填 id——按搜索结果的第一条自动取会静默选错人（实测搜 `Ono Ryouko` 会同时命中另一个人的某个别名行）。
 
 走官方 kana JSON API（只用标准库 `urllib`），带限流、退避重试与三阶段字段裁剪：角色名来自便宜的 `/character` 查询，在 `/vn` 上展开 `va.character.name` 会让同样 100 部作品从 2 秒变成 30 秒。组合也不是每个各算一遍交集（那是 2^N 次全量遍历）：一次遍历得到每部作品的出演者集合，再只枚举这个集合自己的子集，而一部作品通常只被两三个人共享。
+
+失败的路径也照「别让用户白等」来安排。输出目录在抓取之前就先建一次：`-o Z:\nope\deeper` 以前要等打完 5 个请求才炸在 `os.makedirs` 上，几分钟的抓取白费，现在是零请求返回一句话。抓完才写不出去（盘满、整条路径过 260、目标正被 Excel 占着）报成一句话而不是一段栈，抓回来的东西还在会话缓存里，换个目录再点一次「开始」不必重抓。命令行在一个文件都没写出来时以非零退出，`ap.error` 那类用法错误照旧是 2。某个人抓失败时整份结果不进缓存——否则再点一次「开始」是零请求、同一份残缺结果，除非用户想到去勾「重新抓取」。撞上官方限额（这里按 190 请求 / 5 分钟留了余量）要等 5 秒以上时，日志里会说一声等多久；限流窗口挂在 `ctx.session` 上，也就是跨线程共享的，记账整段在一把模块级锁里做。
 
 GUI 里查询前先摆一张「将要抓取」的表，ID 一列双击即可在浏览器里核对是不是这个人；名字有歧义时这张表换成全部候选，比预览框里只放得下的前几行好选。跑完把共同出演（三人以上是全员那一档，只有一个人时是他的全部出演记录）铺成表格，核对几部作品不必再开 Excel；各组合各自多少部则列在摘要里。
 
@@ -113,8 +115,10 @@ except Cancelled as c:
 pytest
 ```
 
-覆盖三个工具的纯逻辑与 registry 的容错，不含 GUI 自动化测试。`pytest.ini` 里的 `pythonpath = .` 让 `galtools` 无需安装即可导入。vndb 那套测试零联网：`api` 模块只留 `_open` / `_sleep` 两个注入点，测试全打这两处（假睡眠顺带推进一个假时钟，否则限流的滑动窗口永远滚不过去）。
+覆盖三个工具的纯逻辑、registry 的容错，以及 GUI 里几个「坏了也没人喊」的分支。`pytest.ini` 里的 `pythonpath = .` 让 `galtools` 无需安装即可导入。vndb 那套测试零联网：`api` 模块只留 `_open` / `_sleep` 两个注入点，测试全打这两处（假睡眠顺带推进一个假时钟，否则限流的滑动窗口永远滚不过去）。
 
-GUI 没有自动化测试，手动验证脚本放在 `tests/manual/`：`testpaths = tests` 只收 `test_*.py`，这几个不会被 pytest 捡走，要跑就 `python tests/manual/gui_smoke.py`。`gui_smoke.py` 离屏起真窗口走完「选工具 → 查询 → 预览 → 开始 → 改参数 → 重开窗」一整轮，vndb 那层换成测试里的假接口；`gui_widgets.py` 造一个假工具钉住整表级错误与表格的排序、链接、复制；`vndb_live.py` 是唯一真联网的一个，拿真实 s367 与实测基准对账——接口哪天改了字段，只有它能发现。
+`tests/test_gui.py` 顶上是 `pytest.importorskip('PySide6')`，没装 Qt 就整个文件跳过——命令行用法不该因为缺 Qt 连测试都跑不了。它离屏跑，钉四件事：活计换代后被放弃的线程发的日志、进度、结果一律丢弃；取消时挂在 `Cancelled` 上的 `partial` 要送到 `run_cancelled`；预览失败后进度条要从无限滚动收回来；路径被剥到只剩盘符时要把分隔符补回去（`E:` 指的是该盘的当前工作目录而非根目录，`isdir` 却照样为真，产出会静默落到别处）。这四处的变异在此之前都能全绿通过。
 
-前两个脚本都把 `main_window.QSettings` 换成临时 ini。PySide6 里 `QSettings(org, app)` 不看 `setDefaultFormat()`，照样写注册表，不换会把验证用的路径写进用户的真实配置。
+更完整的一轮留给 `tests/manual/` 里的手动脚本：`testpaths = tests` 只收 `test_*.py`，这几个不会被 pytest 捡走，要跑就 `python tests/manual/gui_smoke.py`。`gui_smoke.py` 离屏起真窗口走完「选工具 → 查询 → 预览 → 开始 → 改参数 → 重开窗」一整轮，vndb 那层换成测试里的假接口；`gui_widgets.py` 造一个假工具钉住整表级错误与表格的排序、链接、复制；`vndb_live.py` 是唯一真联网的一个，拿真实 s367 与实测基准对账——接口哪天改了字段，只有它能发现；`mjo_offset_diff.py` 要一批真 `.mjo` 才有意义，用来复核字节码起点那条结论。
+
+前两个脚本都把 `main_window.QSettings` 换成临时 ini（`tests/test_gui.py` 同理）。PySide6 里 `QSettings(org, app)` 不看 `setDefaultFormat()`，照样写注册表，不换会把验证用的路径写进用户的真实配置。

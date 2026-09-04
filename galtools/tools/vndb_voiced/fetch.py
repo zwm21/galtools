@@ -397,7 +397,13 @@ def _in_order(entries):
 
 
 def intersect(items):
-    """N 人共同出演：按 vid 求交集，每部作品带上各人在其中配的角色。"""
+    """N 人共同出演：按 vid 求交集，每部作品带上各人在其中配的角色。
+
+    生产代码不再调用它（工具层一律走 combos，全员那一档就是 combos 的第一项）。
+    留着是当参照实现：combos 用的是「按作品枚举出演者子集」那套聪明算法，
+    test_combos_matches_intersect_and_is_sorted 拿这个笨办法给它对答案，删了就等于
+    把那道校验一起删掉。
+    """
     if not items:
         return []
     maps = _by_vid(items)

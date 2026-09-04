@@ -28,9 +28,10 @@ JOIN_TIMEOUT = 1.0
 def emit(signal, *args):
     """发信号，但容忍 Bridge 已经没了。
 
-    stop() 只等 5 秒，卡在一个网络请求里的工具可能超时；等它醒过来时窗口已关、
-    Bridge 已析构，emit 会抛 RuntimeError: Signal source has been deleted，在
-    后台线程里变成一段没人能处理的栈。这时候的结果本就没人要了，咽掉即可。
+    stop() 只等 JOIN_TIMEOUT 那一秒，卡在一个网络请求里的工具会超时；等它醒过来时
+    窗口已关、Bridge 已析构，emit 会抛 RuntimeError: Signal source has been
+    deleted，在后台线程里变成一段没人能处理的栈。这时候的结果本就没人要了，
+    咽掉即可。
     """
     try:
         signal.emit(*args)
