@@ -12,7 +12,7 @@ import pytest
 
 from galtools.core.context import Cancelled, RunContext
 from galtools.tools.mjo_text import (
-    MERGED_NAME, extract_mjo, is_valid_str, resolve_paths, run,
+    MERGED_NAME, extract_mjo, is_valid_str, main, resolve_paths, run,
 )
 
 V1 = b'MajiroObjV1.000\x00'
@@ -260,6 +260,35 @@ def test_run_leaves_the_merged_text_alone_when_there_is_no_input(tmp_path):
     assert not (tmp_path / 'out').exists()     # 连输出目录都不建
 
 
+def test_run_says_so_instead_of_raising_when_the_dir_is_missing(tmp_path):
+    """命令行直接调 run，没有 preview 那道闸。目录名敲错该得到一句话而不是
+    traceback，也绝不能碰输出目录。"""
+    missing = tmp_path / 'nope'
+    result = run({'src_dir': str(missing), 'out_dir': str(tmp_path / 'out')},
+                 RunContext())
+    assert '目录不存在' in result.summary
+    assert result.output_paths == []
+    assert [n for n, _ in result.failures] == [str(missing)]
+    assert not (tmp_path / 'out').exists()
+
+
+def test_run_says_so_instead_of_raising_when_the_dir_is_unreadable(tmp_path,
+                                                                  monkeypatch):
+    """isdir 为真但 listdir 抛 OSError：权限不足、盘掉线都会走到这里。"""
+    src = tmp_path / 'src'
+    src.mkdir()
+
+    def boom(_):
+        raise PermissionError(13, '拒绝访问')
+
+    monkeypatch.setattr('galtools.tools.mjo_text.os.listdir', boom)
+    result = run({'src_dir': str(src), 'out_dir': str(tmp_path / 'out')},
+                 RunContext())
+    assert '无法读取目录' in result.summary
+    assert result.output_paths == []
+    assert not (tmp_path / 'out').exists()
+
+
 def test_run_collects_per_file_failures(tmp_path):
     src = tmp_path / 'src'
     src.mkdir()
@@ -300,3 +329,25 @@ def test_cancel_is_not_swallowed_as_a_parse_failure(tmp_path):
     with pytest.raises(Cancelled):
         run({'src_dir': str(src), 'out_dir': str(tmp_path / 'out')}, ctx)
     assert not (tmp_path / MERGED_NAME).exists()
+
+
+# ---------------- 命令行 ----------------
+def test_cli_exit_code_says_whether_anything_was_written(monkeypatch, tmp_path):
+    """什么都没写出来就得非零退出，与 vndb_voiced/cli.py 同一套约定。以前不论
+    目录不存在还是目录里没有 .mjo 都是 exit 0，脚本里的 && 不会断。"""
+    import galtools.tools.mjo_text as mod
+
+    src = tmp_path / 'src'
+    src.mkdir()
+    out = tmp_path / 'out'
+
+    monkeypatch.setattr(mod.sys, 'argv',
+                        ['mjo_text', str(tmp_path / 'nope'), str(out)])
+    assert main() == 1                       # 目录不存在
+
+    monkeypatch.setattr(mod.sys, 'argv', ['mjo_text', str(src), str(out)])
+    assert main() == 1                       # 目录在，但没有 .mjo
+
+    (src / 'a.mjo').write_bytes(build_mjo(
+        show_text('あ') + dialog_close() + PAD))
+    assert main() == 0                       # 写出来了

@@ -210,7 +210,16 @@ def preview(params, ctx):
 
 def run(params, ctx):
     src_dir, out_dir, merged_path = resolve_paths(params)
-    files = list_mjo(src_dir)
+    # preview 里有这两道闸，run 也得各有一份：命令行不走 preview，直接调 run。
+    # 不然目录名敲错只得到一段 traceback，而不是一句能读的话。
+    if not os.path.isdir(src_dir):
+        return RunResult(summary='目录不存在：%s' % src_dir,
+                         failures=[(src_dir, '目录不存在')])
+    try:
+        files = list_mjo(src_dir)
+    except OSError as e:
+        return RunResult(summary='无法读取目录：%s' % e,
+                         failures=[(src_dir, str(e))])
     if not files:
         # 一个文件都没有时绝不碰合并全文：它很可能是上一次的成果，而下面那个
         # 'w' 会把它清成空文件。GUI 靠 preview 的 ok=False 挡住这种情况，命令行
@@ -278,7 +287,16 @@ def main():
     # 走 ConsoleContext 会多出 \r 进度行，破坏既有 stdout 格式。
     result = run({'src_dir': src_dir, 'out_dir': out_dir}, RunContext())
     print(result.summary)
+    # 一个文件都没写出来时以非零退出，与 vndb_voiced/cli.py 同一套约定，好让脚本
+    # 里的 && 断开：目录不存在、目录不可读、目录里没有 .mjo 这三种都没产出。
+    # 有文件但全都解析失败仍算 0——txt 目录与合并全文照样写了（合并全文是空的），
+    # 失败清单在 summary 里。要区分那种情况得看 failures，不在退出码里表达。
+    return 0 if result.output_paths else 1
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print('\n\n[!] 用户中断（Ctrl+C），已退出。已写出的 txt 保留在输出目录中。')
+        sys.exit(130)
