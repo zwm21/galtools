@@ -206,6 +206,15 @@ def preview(params, ctx):
 def run(params, ctx):
     """命令行从不预览，所以 run 自己也要解析目标、自己也要抓。"""
     _apply_refresh(params, ctx)
+    out_dir = params.get('out_dir')
+    try:
+        # 抓之前先把目录建出来。GUI 侧 validate 已经拦过一道，命令行的 -o 没人
+        # 拦：实测 -o Z:\nope\deeper 是在打完 5 个请求之后才炸的，几分钟的抓取
+        # 白费。
+        os.makedirs(xlsx.target_dir(out_dir), exist_ok=True)
+    except OSError as e:
+        return RunResult(summary='\n输出目录不可用，没有抓取：%s' % e,
+                         failures=[('输出目录', str(e))])
     try:
         resolutions = fetch.ensure_resolved(params, ctx)
     except api.ApiError as e:
@@ -237,7 +246,13 @@ def run(params, ctx):
 
     groups = fetch.combos(items) if len(items) > 1 else []
     ctx.log('正在写 Excel…')
-    path = xlsx.save(items, groups, params.get('out_dir'))
+    try:
+        path = xlsx.save(items, groups, out_dir)
+    except OSError as e:
+        # 先挡不掉的那几种：磁盘满、整条路径过了 260、目标文件正被 Excel 占着。
+        # 抓回来的东西还在 ctx.session 里，换个目录再点一次「开始」不必重抓。
+        return RunResult(summary='\n写 Excel 失败，没有输出文件：%s' % e,
+                         failures=failures + [('写 Excel', str(e))])
 
     lines = ['\n========== 执行结果 ==========']
     for item in items:

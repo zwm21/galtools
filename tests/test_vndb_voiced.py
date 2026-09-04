@@ -923,6 +923,18 @@ def test_save_accepts_an_explicit_xlsx_path(tmp_path):
     assert path == str(target) and os.path.exists(path)
 
 
+def test_target_dir_agrees_with_where_save_writes(tmp_path):
+    """工具层靠 target_dir 在抓取之前先建目录，它算出的必须与 save 真正写入的
+    目录一致——两处各写一份判断就会挡下一个地方、写进另一个地方。"""
+    pytest.importorskip('openpyxl')
+    assert xlsx.target_dir(str(tmp_path)) == str(tmp_path)
+    assert xlsx.target_dir(None) == os.path.abspath('.')
+    target = tmp_path / 'sub' / 'x.xlsx'
+    assert xlsx.target_dir(str(target)) == str(tmp_path / 'sub')
+    assert os.path.dirname(xlsx.save([person('s1', [])], [], str(target))) \
+        == xlsx.target_dir(str(target))
+
+
 def test_clean_strips_control_chars():
     assert xlsx.clean('a\x01b\nc') == 'ab\nc'
     assert xlsx.clean(5) == 5
@@ -1067,6 +1079,38 @@ def test_run_cancelled_carries_an_empty_partial(monkeypatch, tmp_path):
     with pytest.raises(Cancelled) as caught:
         tool.run({'staff': 's1', 'out_dir': str(tmp_path)}, RunContext())
     assert '取消' in caught.value.partial.summary
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_run_refuses_a_bad_output_dir_before_spending_a_request(monkeypatch,
+                                                                tmp_path):
+    """写不进去的目录要在抓取之前挡下。倒过来的话用户得等几分钟才知道 -o 打错。"""
+    fake = FakeApi(vndb()).install(monkeypatch)
+    blocker = tmp_path / 'not_a_dir'
+    blocker.write_text('x', encoding='utf-8')      # 拿文件当父目录，makedirs 必炸
+    result = tool.run({'staff': 's1', 'out_dir': str(blocker / 'sub')},
+                      RunContext())
+    assert '输出目录不可用' in result.summary
+    assert result.output_paths == []
+    assert [name for name, _ in result.failures] == ['输出目录']
+    assert fake.calls == []                        # 一个请求都没打出去
+
+
+def test_run_reports_a_write_failure_instead_of_a_traceback(monkeypatch,
+                                                            tmp_path):
+    """抓完了才写不出去（盘满、路径过长、文件被 Excel 占着）：OSError 不能穿到
+    GUI 那层变成一段红色的栈。"""
+    FakeApi(vndb()).install(monkeypatch)
+
+    def boom(*_args, **_kwargs):
+        raise OSError(28, 'No space left on device')
+
+    monkeypatch.setattr(xlsx, 'save', boom)
+    result = tool.run({'staff': 's1, s2', 'out_dir': str(tmp_path)},
+                      RunContext())
+    assert '写 Excel 失败' in result.summary
+    assert result.output_paths == []
+    assert [name for name, _ in result.failures] == ['写 Excel']
     assert list(tmp_path.iterdir()) == []
 
 
