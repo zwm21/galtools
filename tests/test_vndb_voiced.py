@@ -1178,3 +1178,11 @@ def test_cli_check_targets():
     assert cli.check_targets('s1, s2')[0] == ['s1', 's2']
     assert cli.check_targets('')[1] == '没解析出任何目标。'
     assert '作品' in cli.check_targets('https://vndb.org/v3')[1]
+
+
+def test_cli_shares_the_person_cap_with_the_gui():
+    """规则只有一份：以前人数上限只装在 validate 里，命令行完全不受约束。"""
+    ok = ', '.join('s%d' % i for i in range(1, tool.MAX_TARGETS + 1))
+    assert cli.check_targets(ok) == (fetch.parse_targets(ok), '')
+    targets, error = cli.check_targets(ok + ', s99')
+    assert targets == [] and '最多 %d 个人' % tool.MAX_TARGETS in error
