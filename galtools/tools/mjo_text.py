@@ -19,12 +19,15 @@ mjo 结构（MajiroObjV1.000，未加密）：
 输出：每个 mjo 一个 .txt（UTF-8），外加一个合并全文本。
 
 已知怪癖，均为既有行为，刻意保留：
-  * BYTECODE_BEGIN 硬编码 0x28，只在 count == 1 时才等于真正的 header_len。
-    实测 144 个文件中 22 个 count != 1（全是 buttonmenu/cgmode/config 之类 UI
-    脚本），它们的入口表会被当作字节码扫描。剧情脚本 count 基本为 1，几乎不受影响。
   * 主循环 `i + 2 < script_len` 会漏掉最后一个 opcode。
   * 合并全文写在输出目录的**父**目录；输出目录为相对路径时父目录为空串，
     退化成当前工作目录。
+
+已修掉的一处：字节码起点原先硬编码 0x28，只在 count == 1 时才等于真正的
+header_len。实测 144 个文件中 22 个 count != 1（全是 buttonmenu/cgmode/config
+之类 UI 脚本），它们的入口函数表会被当作字节码扫描，扫出乱码或直接报解析失败。
+现在按 header_len 起步：count == 1 的剧情脚本产出逐字节不变，那 22 个 UI 脚本
+与旧脚本的产出会不同——那本来就是旧脚本的错。
 """
 import os
 import struct
@@ -41,7 +44,6 @@ AdvEvtType = 0x002
 AdvBrkLine = 0x06E
 AdvClkWait = 0x070
 AdvDialCls = 0x077
-BYTECODE_BEGIN = 0x28
 
 MERGED_NAME = 'scenario_text_全文.txt'
 # extract_mjo 实际可能抛出的异常。原先是 except Exception，会把 Cancelled
@@ -89,7 +91,7 @@ def extract_mjo(path):
         cur = ''
         has_text = False
 
-    i = BYTECODE_BEGIN
+    i = header_len
     while i + 2 < script_len:
         cmd = struct.unpack_from('<H', script, i)[0]
         if cmd == ShowText:
