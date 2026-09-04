@@ -422,14 +422,20 @@ class MainWindow(QMainWindow):
         if not self.runner.is_current_preview(gen) or self._preview_page is None:
             return
         self._preview_page.show_preview(result)
-        self.progress.setValue(0)
-        self.progress.setMaximum(100)
-        self.status.setText('就绪')
+        self._idle()
 
     def _on_preview_failed(self, gen, msg):
         if not self.runner.is_current_preview(gen) or self._preview_page is None:
             return
         self._preview_page.show_preview_error(msg)
+        # 预览一开头的 progress(0, 0, …) 把进度条切成了无限滚动，失败时也得收
+        # 回来，否则它会一直滚、状态栏也一直停在「正在查…」。
+        self._idle('预览失败')
+
+    def _idle(self, text='就绪'):
+        self.progress.setMaximum(100)
+        self.progress.setValue(0)
+        self.status.setText(text)
 
     def _start_run(self, page):
         errors = page.validation_errors()
