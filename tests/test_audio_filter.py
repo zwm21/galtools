@@ -198,6 +198,21 @@ def test_scan_counts_unparsable_as_failure(tmp_path):
     assert len(audio) == 1 and len(failed) == 1 and total == 2
 
 
+def test_truncated_ogg_is_one_failure_not_a_dead_scan(tmp_path):
+    """截断到几十字节的 ogg 会在头部切片上抛 struct.error。它必须只算这一个
+    文件失败——原先它会一路穿到界面，把整次扫描连同已解析的结果一起废掉。"""
+    root = tmp_path / 'root'
+    root.mkdir()
+    make_wav(root / '好.wav', 1.0)
+    # 'OpusHead' 贴在文件末尾，preskip 字段只剩 1 个字节
+    (root / '截断.ogg').write_bytes(b'OggS' + b'\x00' * 20 + b'OpusHead' + b'\x01')
+    assert core.get_duration(str(root / '截断.ogg')) is None
+    audio, failed, total = core.scan_audio_files(str(root), recursive=False)
+    assert [os.path.basename(p) for p, _, _ in audio] == ['好.wav']
+    assert [os.path.basename(p) for p in failed] == ['截断.ogg']
+    assert total == 2
+
+
 def test_scan_reports_progress_and_honours_cancel(tmp_path):
     root = tmp_path / 'root'
     root.mkdir()
