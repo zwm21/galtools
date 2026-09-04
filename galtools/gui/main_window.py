@@ -448,6 +448,10 @@ class MainWindow(QMainWindow):
         self.tree.setEnabled(False)
         self._outputs = []
         self.open_btn.setEnabled(False)
+        # 一轮运行从头接管进度条，不继承上一次预览留下的无限滚动：预览开头那句
+        # progress(0, 0, …) 把 maximum 设成 0，而运行取消或出错时只改状态栏文字
+        # （要留住已完成的进度），进度条就会一直滚下去。
+        self.progress.setMaximum(100)
         self.progress.setValue(0)
         self._run_started = time.monotonic()
         self._active_page = page

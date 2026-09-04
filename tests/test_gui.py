@@ -116,6 +116,32 @@ def test_a_failed_preview_puts_the_progress_bar_back(qt_app, monkeypatch,
         win.close()
 
 
+def test_starting_a_run_takes_over_the_progress_bar(qt_app, monkeypatch,
+                                                    tmp_path):
+    """预览开头那句 progress(0, 0, …) 把进度条切成无限滚动，而运行取消/出错时只
+    改状态栏文字（要留住已完成的进度）。所以接管必须发生在起跑的那一刻，否则
+    「预览过一次 → 开始 → 取消」之后进度条会一直滚，看着像还在跑。"""
+    win = window(monkeypatch, tmp_path)
+    try:
+        page = win.pages['mjo_text']
+        page.form._editors['src_dir'].setCurrentText(str(tmp_path))
+        assert page.validation_errors() == {}          # 证明起跑不会被校验拦下
+        monkeypatch.setattr(win.runner, 'start_run',
+                            lambda *a, **k: None)      # 不真起线程
+
+        win._on_progress(0, 0, '正在查…')               # 预览留下的无限滚动
+        assert win.progress.maximum() == 0
+
+        win._start_run(page)
+        assert win.progress.maximum() == 100
+
+        win._on_run_cancelled(None)
+        assert win.progress.maximum() == 100
+        assert win.status.text() == '已取消'
+    finally:
+        win.close()
+
+
 def test_a_drive_root_keeps_its_separator():
     """`E:` 指的是 E 盘的当前工作目录而不是根目录，isdir 却照样为真：选了盘根做
     输出目录，文件会静默落到进程的 cwd 里。"""
