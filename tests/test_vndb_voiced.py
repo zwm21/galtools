@@ -300,6 +300,34 @@ def test_min_interval_between_requests(monkeypatch):
     assert sum(fake.sleeps) == pytest.approx(api.MIN_INTERVAL, abs=0.01)
 
 
+def test_hitting_the_quota_says_so_once(monkeypatch):
+    """撞配额得等几百秒。一声不响地停在那里，用户只会以为程序死了。
+
+    第 4 个请求同样是撞配额，但只需等一个最小间隔（前一条刚滚出窗口）——它不该
+    再报一次，否则配额满了之后每个请求都会刷一行。
+    """
+    fake = FakeApi(lambda p, b, n: page([])).install(monkeypatch)
+    ctx = CountingCtx(10 ** 9)
+    client = api.Client(ctx, quota=2)
+    for _ in range(4):
+        client.post('vn', {})
+    said = [msg for level, msg in ctx.logs if level == 'warn' and '配额' in msg]
+    assert said == ['vndb 的请求配额已用满，等 300 秒后继续']
+    assert sum(fake.sleeps) > api.RATE_WINDOW - 1      # 该等的照样等
+    assert len(fake.calls) == 4
+
+
+def test_the_minimum_interval_keeps_quiet(monkeypatch):
+    """两次请求之间的 0.25 秒不值得说：配额满了之后每个请求都要等这么一下，
+    逐条报的话一次抓取能刷出上百行。"""
+    FakeApi(lambda p, b, n: page([])).install(monkeypatch)
+    ctx = CountingCtx(10 ** 9)
+    client = api.Client(ctx)
+    client.post('vn', {})
+    client.post('vn', {})
+    assert ctx.logs == []
+
+
 def test_rate_window_lives_on_the_session_not_the_client(monkeypatch):
     """一次 run 会建两个 Client（解析一个、抓取一个），反复运行更是每次全新。
     窗口挂实例上就等于每几十个请求清零一次，配额永远数不到头。"""

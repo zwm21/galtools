@@ -9,12 +9,14 @@
     _sleep(seconds)       睡觉（限流与退避）
 
 限流按官方的 200 请求 / 5 分钟做滑动窗口，窗口存在 ctx.session 上而不是 Client
-实例上——一次 run 会建两个 Client（解析一个、抓取一个）。睡眠切成小片、片间
-check_cancel，否则一次长睡会把用户的取消吞掉；取消的粒度是「当前这一个请求」
-（实测单次 0.6–3 秒）。真卡在 socket 上时 GUI 那边不靠等待它退出来保证正确性，
-见 gui/worker.py 顶上的说明。
+实例上——一次 run 会建两个 Client（解析一个、抓取一个）。窗口既然是共享的，记账
+就得整段在 RATE_LOCK 里做；撞上配额、要等 5 秒以上时往 ctx.log 报一句，不然界面
+上只看得见它停住了。睡眠切成小片、片间 check_cancel，否则一次长睡会把用户的取消
+吞掉；取消的粒度是「当前这一个请求」（实测单次 0.6–3 秒）。真卡在 socket 上时
+GUI 那边不靠等待它退出来保证正确性，见 gui/worker.py 顶上的说明。
 """
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -27,16 +29,25 @@ TIMEOUT = 60.0
 CHUNK = 65536
 
 RATE_WINDOW = 300.0      # 官方限额窗口：5 分钟
-RATE_QUOTA = 190         # 官方 200，留 10 次余量给同一时段别的调用
+RATE_QUOTA = 190         # 官方 200，留 10 次余量给同一时段别的调用与下面的抢跑
 MIN_INTERVAL = 0.25      # 未逼近限额时的最小请求间隔
 SLEEP_SLICE = 0.2        # 睡眠切片长度，片间查一次取消
 MAX_ATTEMPTS = 4
 BACKOFF_BASE = 2.0
 MAX_RETRY_AFTER = 60.0   # 服务端让等更久也不等：宁可报错让用户自己决定
+# 等多久才值得说一声。配额打满后的第一次等待是几百秒，之后每次只等一个最小
+# 间隔——不设门槛的话一次抓取能刷出上百行「正在等」。
+LOG_WAIT_MIN = 5.0
 # 滑动窗口存在 ctx.session 里的键，与 fetch 的三个缓存键并列。刻意不进
 # fetch.CACHE_KEYS：勾「重新抓取」清的是抓来的数据，不该把已经打出去的请求
 # 记录也一起忘掉。
 RATE_KEY = 'vndb_rate'
+# 窗口挂在 ctx.session 上，也就是跨线程共享的：GUI 取消一份活只 join 一秒，卡在
+# socket 上的旧线程可能还活着，仍会 append/popleft 同一个 deque。记账因此整段
+# 在锁内做——刚判过非空的 self._stamps[0] 被另一个线程 popleft 掉就是 IndexError，
+# 而炸的是用户正在等的那份新活。追加时间戳留在锁外：append 本身是原子的，抢跑
+# 最多让配额略微超出，那 10 次余量就是给它的。
+RATE_LOCK = threading.Lock()
 
 
 class ApiError(Exception):
@@ -118,19 +129,35 @@ class Client:
                 return
             _sleep(min(SLEEP_SLICE, left))
 
-    def _throttle(self):
-        while True:
+    def _next_gap(self):
+        """锁内做一次窗口记账，返回 (还要等多久, 是不是撞了配额)。
+
+        睡眠留在锁外：持锁睡觉会把并发的请求全串成一条队，而窗口只需要在记账的
+        那一瞬间是一致的。
+        """
+        with RATE_LOCK:
             now = time.monotonic()
             while self._stamps and now - self._stamps[0] >= RATE_WINDOW:
                 self._stamps.popleft()
-            if len(self._stamps) < self._quota:
-                break
-            # 睡到最老的那条滚出窗口为止。
-            self._wait(RATE_WINDOW - (now - self._stamps[0]) + 0.05)
-        if self._stamps:
-            gap = MIN_INTERVAL - (time.monotonic() - self._stamps[-1])
-            if gap > 0:
-                self._wait(gap)
+            if len(self._stamps) >= self._quota:
+                # 睡到最老的那条滚出窗口为止。
+                return RATE_WINDOW - (now - self._stamps[0]) + 0.05, True
+            if self._stamps:
+                return max(0.0, MIN_INTERVAL - (now - self._stamps[-1])), False
+            return 0.0, False
+
+    def _throttle(self):
+        while True:
+            gap, blocked = self._next_gap()
+            if gap <= 0:
+                return
+            if blocked and gap >= LOG_WAIT_MIN and self._ctx is not None:
+                # 一声不响地卡几分钟，用户只会以为程序死了。
+                self._ctx.log('vndb 的请求配额已用满，等 %d 秒后继续' % round(gap),
+                              'warn')
+            self._wait(gap)
+            if not blocked:
+                return
 
     # ---------- 请求 ----------
     def post(self, path, body):
