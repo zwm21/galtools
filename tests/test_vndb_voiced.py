@@ -299,6 +299,22 @@ def test_min_interval_between_requests(monkeypatch):
     assert sum(fake.sleeps) == pytest.approx(api.MIN_INTERVAL, abs=0.01)
 
 
+def test_rate_window_lives_on_the_session_not_the_client(monkeypatch):
+    """一次 run 会建两个 Client（解析一个、抓取一个），反复运行更是每次全新。
+    窗口挂实例上就等于每几十个请求清零一次，配额永远数不到头。"""
+    fake = FakeApi(lambda p, b, n: page([])).install(monkeypatch)
+    ctx = RunContext()
+    api.Client(ctx, quota=2).post('vn', {})
+    api.Client(ctx, quota=2).post('vn', {})
+    assert len(ctx.session[api.RATE_KEY]) == 2      # 两个实例记在同一个窗口里
+
+    fake.sleeps.clear()
+    api.Client(ctx, quota=2).post('vn', {})         # 第三个请求撞上配额
+    assert sum(fake.sleeps) > api.RATE_WINDOW - 1
+    # 没有 ctx 时退回实例级，测试与一次性脚本照旧
+    assert api.Client(quota=2)._stamps is not ctx.session[api.RATE_KEY]
+
+
 # ---------------- 一个迷你 vndb ----------------
 # s1 有两个别名（a1 主名、a2 别名）；v1 里 s1 配了 c1 与 c2，s2 配了 c3；
 # c2 还在 v2 里出现过（v2 由 s2 配），所以 v2 会被嵌套 filter 当成 s1 的候选
