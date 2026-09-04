@@ -487,6 +487,20 @@ def test_ensure_resolved_caches_until_cleared(monkeypatch):
     assert len(fake.calls) > spent
 
 
+def test_ensure_resolved_refetches_when_the_target_changes(monkeypatch):
+    """换了人必须重解析。上一条测试两次给的是同一个键（'s1, s2' 与 's1,s2'
+    归一化后相同），所以它管不住键比较那一半：漏掉的话换人之后拿回的是上一批人。"""
+    fake = FakeApi(vndb()).install(monkeypatch)
+    ctx = RunContext()
+    client = api.Client(ctx)
+    first = fetch.ensure_resolved({'staff': 's1'}, ctx, client)
+    spent = len(fake.calls)
+    second = fetch.ensure_resolved({'staff': 's2'}, ctx, client)
+    assert [r.staff.sid for r in second] == ['s2']
+    assert second is not first
+    assert len(fake.calls) > spent
+
+
 def test_ensure_counts_is_cached(monkeypatch):
     fake = FakeApi(vndb()).install(monkeypatch)
     ctx = RunContext()
@@ -511,7 +525,36 @@ def test_ensure_credits_isolates_one_persons_failure(monkeypatch):
     assert ctx.progress_calls[0] == (1, 4, 'Alpha One 1/2')
     spent = len(fake.calls)
     assert fetch.ensure_credits(staffs, ctx, client) == (items, failures)
+    assert len(fake.calls) > spent      # 残缺结果不进缓存，再点一次真的重抓
+
+
+def test_ensure_credits_caches_a_clean_fetch(monkeypatch):
+    """全成功才缓存——不能因为「失败的不缓存」把缓存本身取消掉，预览之后紧接着
+    run 的那次复用全靠它。"""
+    fake = FakeApi(vndb()).install(monkeypatch)
+    ctx = RunContext()
+    client = api.Client(ctx)
+    staffs = [fetch.load_staff('s1', client)]
+    first = fetch.ensure_credits(staffs, ctx, client)
+    assert first[1] == []
+    spent = len(fake.calls)
+    assert fetch.ensure_credits(staffs, ctx, client) == first
     assert len(fake.calls) == spent
+
+
+def test_ensure_credits_refetches_when_the_people_change(monkeypatch):
+    """换了人必须重抓。这一处比 resolve 那处更凶：预览根本不抓 credits，键比较
+    漏掉的话用户拿到的工作簿从头到尾都是上一批人的数据，界面上看不出破。"""
+    fake = FakeApi(vndb()).install(monkeypatch)
+    ctx = RunContext()
+    client = api.Client(ctx)
+    one, two = fetch.load_staff('s1', client), fetch.load_staff('s2', client)
+    items, _ = fetch.ensure_credits([one], ctx, client)
+    assert [i.staff.sid for i in items] == ['s1']
+    spent = len(fake.calls)
+    items, _ = fetch.ensure_credits([one, two], ctx, client)
+    assert [i.staff.sid for i in items] == ['s1', 's2']
+    assert len(fake.calls) > spent
 
 
 def test_cancel_propagates_through_ensure_credits(monkeypatch):
