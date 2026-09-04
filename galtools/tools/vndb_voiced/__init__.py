@@ -76,7 +76,7 @@ def _candidate_table(problems):
                  title='改填其中一个 ID')
 
 
-def _common_table(items, common):
+def _common_table(items, common, title=None):
     """共同出演：一行一部作品，每人一列各自配的角色。"""
     rows = []
     for entry in common:
@@ -89,7 +89,7 @@ def _common_table(items, common):
         rows.append(tuple(row))
     return Table(columns=('发售日', 'Title', '日文原名')
                          + tuple(xlsx.cast_columns(items)),
-                 rows=rows, title='共同出演 %d 部' % len(common))
+                 rows=rows, title=title or '共同出演 %d 部' % len(common))
 
 
 def _credits_table(item):
@@ -109,6 +109,22 @@ def combo_names(items, combo):
     """组合里各人的罗马音，摘要与索引页共用一种写法。"""
     return '、'.join(items[i].staff.name or items[i].staff.sid
                      for i in combo.members)
+
+
+def unique_people(resolutions):
+    """按 sid 去重，返回 (保留的解析结果, 被合并掉的个数)。
+
+    `s367, Ono Ryouko` 是两个不同的字串、指向同一个人，parse_targets 那层按字串
+    去重看不出来。不合并的话这个人会被抓两遍、出两页一模一样的明细，还多一张
+    「他和他自己」的共同出演页。
+    """
+    out, seen = [], set()
+    for res in resolutions:
+        if res.staff.sid in seen:
+            continue
+        seen.add(res.staff.sid)
+        out.append(res)
+    return out, len(resolutions) - len(out)
 
 
 def validate(params):
@@ -144,16 +160,19 @@ def preview(params, ctx):
 
     client = api.Client(ctx)
     ctx.progress(0, 0, '正在查 vndb…')
-    resolutions = fetch.ensure_resolved(params, ctx, client)
-    done = [r for r in resolutions if r.ok]
-    problems = [r for r in resolutions if not r.ok]
+    try:
+        resolutions = fetch.ensure_resolved(params, ctx, client)
+        done, merged = unique_people([r for r in resolutions if r.ok])
+        found = [(r.staff,) + tuple(fetch.ensure_counts(r.staff, ctx, client))
+                 for r in done]
+    except api.ApiError as e:
+        # ApiError 已经是人话，不能让它穿到 worker 那层变成一段栈。
+        return PreviewResult(summary='vndb 接口出错：%s' % e, ok=False)
 
-    lines, total_vns, found = [], 0, []
-    for res in done:
-        chars, vns = fetch.ensure_counts(res.staff, ctx, client)
-        total_vns += vns
-        found.append((res.staff, chars, vns))
-        lines.append('%s：角色 %d，作品 ≤%d' % (res.staff.label(), chars, vns))
+    problems = [r for r in resolutions if not r.ok]
+    total_vns = sum(vns for _, _, vns in found)
+    lines = ['%s：角色 %d，作品 ≤%d' % (staff.label(), chars, vns)
+             for staff, chars, vns in found]
     for res in problems:
         lines.append(fetch.describe_problem(res))
 
@@ -161,6 +180,8 @@ def preview(params, ctx):
     # 预览框里只放得下前几个。
     table = _candidate_table(problems) or _people_table(found)
     warnings = []
+    if merged:
+        warnings.append('有 %d 个目标指向同一个人，已合并。' % merged)
     if not done:
         return PreviewResult(summary='\n'.join(lines), ok=False, table=table,
                              warnings=['没有一个目标能定位到具体的人。'])
@@ -185,11 +206,18 @@ def preview(params, ctx):
 def run(params, ctx):
     """命令行从不预览，所以 run 自己也要解析目标、自己也要抓。"""
     _apply_refresh(params, ctx)
-    resolutions = fetch.ensure_resolved(params, ctx)
-    done = [r for r in resolutions if r.ok]
+    try:
+        resolutions = fetch.ensure_resolved(params, ctx)
+    except api.ApiError as e:
+        # ApiError 已经是人话；放它穿到 worker 那层会变成一段红色的 traceback。
+        return RunResult(summary='\nvndb 接口出错，没有写出文件。',
+                         failures=[('vndb 接口', str(e))])
+    done, merged = unique_people([r for r in resolutions if r.ok])
     problems = [r for r in resolutions if not r.ok]
     for res in problems:
         ctx.log(fetch.describe_problem(res), 'warn')
+    if merged:
+        ctx.log('有 %d 个目标指向同一个人，已合并。' % merged, 'warn')
     unresolved = [(r.target, r.error) for r in problems]
     if not done:
         return RunResult(summary='\n没有一个目标能定位到具体的人，什么都没做。',
@@ -234,10 +262,17 @@ def run(params, ctx):
         warnings.append('%d 个目标没定位到人，已跳过。' % len(unresolved))
     if hard:
         warnings.append('%d 个人抓取失败，已跳过。' % len(hard))
+    if merged:
+        warnings.append('%d 个目标指向同一个人，已合并。' % merged)
     if groups:
-        # 屏幕上只摆得下一张表，摆全员那一档（groups 按人数降序，它在最前）。
-        full = groups[0]
-        table = _common_table([items[i] for i in full.members], full.entries)
+        # 屏幕上只摆得下一张表。groups 按人数降序，优先摆全员那一档，但三人以上
+        # 全员同时出演经常是空的——那就往下取第一个有交集的组合，并在标题里写清
+        # 是哪一档，否则用户明明有几个组合有交集却看到一屏空白。
+        shown = next((c for c in groups if c.entries), groups[0])
+        title = None if len(shown.members) == len(items) else (
+            '%s 共同出演 %d 部' % (combo_names(items, shown), len(shown.entries)))
+        table = _common_table([items[i] for i in shown.members], shown.entries,
+                              title)
     else:
         table = _credits_table(items[0])
     return RunResult(summary='\n'.join(lines), output_paths=[path],
