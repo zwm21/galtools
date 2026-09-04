@@ -220,6 +220,16 @@ def test_relative_out_dir_puts_merged_in_cwd():
     assert merged == os.path.join('.', MERGED_NAME)
 
 
+def test_a_drive_root_is_not_the_drives_working_directory():
+    """`E:` 指的是该盘的当前工作目录，三处都得补回分隔符：源目录会去列错地方，
+    输出目录让 txt 落成 `E:xxx.txt` 这种驱动器相对路径，而算父目录时剥掉尾分隔
+    符又会把补好的 `E:\\` 打回 `E:`。"""
+    src, out, merged = resolve_paths({'src_dir': 'E:', 'out_dir': 'E:'})
+    root = 'E:' + os.sep
+    assert (src, out) == (root, root)
+    assert merged == os.path.join(root, MERGED_NAME)
+
+
 # ---------------- run ----------------
 def test_run_writes_txt_without_trailing_newline(tmp_path):
     src = tmp_path / 'src'
