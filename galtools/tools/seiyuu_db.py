@@ -307,12 +307,20 @@ def run(params, ctx):
                          warnings=_warnings(view), table=view_table(view))
 
     lines = ['\n========== 执行结果 =========='] + describe(view)
-    path = xlsx.unique_path(os.path.join(xlsx.target_dir(out_dir),
-                                         workbook_name(view)))
+    target = xlsx.target_dir(out_dir)
+    try:
+        # 预览之后目录可能被删或拔盘，写之前再建一次，与 vndb 侧对称。
+        os.makedirs(target, exist_ok=True)
+    except OSError as e:
+        lines.append('导出目录建不出来：%s' % e)
+        return RunResult(summary='\n'.join(lines), warnings=_warnings(view),
+                         failures=view.bad_files + [('导出目录', str(e))],
+                         table=view_table(view))
+    path = xlsx.unique_path(os.path.join(target, workbook_name(view)))
     ctx.log('正在写 Excel…')
     ctx.progress(0, 0, '正在写 Excel…')
     try:
-        xlsx.build(view.items, view.groups, path)
+        xlsx.build(view.items, view.groups, path, ctx=ctx)
     except OSError as e:
         lines.append('写 Excel 失败，没有导出文件：%s' % e)
         return RunResult(summary='\n'.join(lines), warnings=_warnings(view),

@@ -431,6 +431,23 @@ def test_run_writes_nothing_without_an_export_dir(tmp_path):
     assert result.failures == [('导出目录', '没填')]
 
 
+def test_run_recreates_an_export_dir_that_vanished_after_preview(tmp_path):
+    """预览时目录还在、执行时没了（被删或拔盘）不该挡住导出：run 自己把目录建回来。"""
+    out = tmp_path / 'out' / 'deeper'
+    result = tool.run(args(trio(tmp_path), out_dir=str(out)), RunContext())
+    assert os.path.basename(result.output_paths[0]) == '声优库_3人.xlsx'
+
+
+def test_run_reports_an_export_dir_it_cannot_create(tmp_path):
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('x', encoding='utf-8')
+    result = tool.run(args(trio(tmp_path), out_dir=str(blocker / 'out')),
+                      RunContext())
+    assert result.output_paths == []
+    assert result.failures[0][0] == '导出目录'
+    assert result.failures[0][1] != ''
+
+
 def test_run_refuses_when_a_name_did_not_match(tmp_path):
     out = tmp_path / 'out'
     out.mkdir()
