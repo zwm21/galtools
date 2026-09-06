@@ -78,8 +78,14 @@ def to_json(item, fetched_at=None):
 
 
 def from_json(data):
-    """dict -> StaffCredits。认不出的键忽略，缺的键取 Credit 自己的默认值。"""
-    staff = Staff(sid=_text(data.get('sid')), name=_text(data.get('name')),
+    """dict -> StaffCredits。认不出的键忽略，缺的键取 Credit 自己的默认值。
+
+    sid 手改成不像 id 的样子时退回空串而不是拒读整份文件：它只是显示与
+    拼 URL 用的标签（URL 有站点前缀），不至于为一个标签丢一库的数据。
+    """
+    sid = _text(data.get('sid'))
+    staff = Staff(sid=sid if SID_RE.match(sid) else '',
+                  name=_text(data.get('name')),
                   original=_text(data.get('original')))
     credits = []
     raw_list = data.get('credits')
