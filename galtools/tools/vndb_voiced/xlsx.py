@@ -168,10 +168,13 @@ def table_name(used, base):
 
 
 # ---------------- 单元格 ----------------
+CELL_TEXT_MAX = 32767  # Excel 单元格字符上限，超了 Excel 打开会报「已修复的记录」
+
+
 def clean(value):
-    """去掉 xml 不接受的控制字符（note 里偶有），非字符串原样返回。"""
+    """去掉 xml 不接受的控制字符（note 里偶有）并截到单元格上限，非字符串原样返回。"""
     if isinstance(value, str):
-        return CONTROL_CHARS.sub('', value)
+        return CONTROL_CHARS.sub('', value)[:CELL_TEXT_MAX]
     return value
 
 
@@ -321,16 +324,23 @@ def target_dir(target):
     return target
 
 
-def build(items, combos, path):
+def build(items, combos, path, ctx=None):
     """写出工作簿，返回 path。
 
     combos 是 fetch.combos 的结果（两两及以上的全部组合，含空组合）。两人时沿用
     旧脚本的单页「共同出演」，哪怕没有交集也留着那张空页；三人以上给每个非空组合
     各一页，并在前面加一张组合索引页。页名与表名都要先定好再写：索引页排在组合页
     之前，但它要引用那些页的最终名字。
+
+    传了 ctx 时每写完一张工作表查一次取消：8 人对应两百多张组合页，这段是
+    抓取之外唯一的取消盲区。取消发生在 wb.save 之前，不会留下半成品文件。
     """
     from openpyxl import Workbook
     from openpyxl.styles import Font
+
+    def checkpoint():
+        if ctx is not None:
+            ctx.check_cancel()
 
     font = Font(color=LINK_COLOR, underline='single')
     wb = Workbook()
@@ -353,23 +363,27 @@ def build(items, combos, path):
             planned.append((combo, ''))
 
     _overview(wb, items, overview, table_name(names, OVERVIEW_TABLE), font)
+    checkpoint()
     if index:
         _combo_index(wb, items, planned, index,
                      table_name(names, COMBO_TABLE), font)
+        checkpoint()
     for combo, title in planned:
         if not title:
             continue
         base = COMMON_TABLE if not many else 'Common_' + '_'.join(
             items[i].staff.sid or str(i) for i in combo.members)
         _common_sheet(wb, items, combo, title, table_name(names, base), font)
+        checkpoint()
     for item in items:
         _staff_sheet(wb, item, sheet_title(used, staff_sheet_base(item.staff)),
                      table_name(names, STAFF_TABLE % item.staff.sid), font)
+        checkpoint()
     wb.save(path)
     return path
 
 
-def save(items, combos, target):
+def save(items, combos, target, ctx=None):
     """target 可以是目录也可以是 .xlsx 路径。返回实际写入的路径。"""
     directory = target_dir(target)
     if (target or '').lower().endswith('.xlsx'):
@@ -377,4 +391,5 @@ def save(items, combos, target):
     else:
         name = workbook_name([i.staff for i in items])
     os.makedirs(directory, exist_ok=True)
-    return build(items, combos, unique_path(os.path.join(directory, name)))
+    return build(items, combos, unique_path(os.path.join(directory, name)),
+                 ctx=ctx)
