@@ -443,6 +443,59 @@ def test_validate_rejects_missing_dir(tmp_path):
     assert validate({'src': '', 'threshold': 6.0}) == []
 
 
+# ---------------- 向导与 validate 的对拍 ----------------
+# cli.py 的问答循环内联了与 validate 等价的规则（提示词逐字保留，不能直接
+# 转发）。这里的对拍保证两份规则对同一份输入结论一致：向导接受的，validate
+# 必须放行；向导拒收的每一个数值，validate 必须报错。vndb 的人数上限当初
+# 就是只装了一边才漏进命令行的。
+def _feed(monkeypatch, answers):
+    it = iter(answers)
+    monkeypatch.setattr('builtins.input', lambda *args, **kwargs: next(it))
+
+
+def test_wizard_threshold_accepts_exactly_what_validate_accepts(monkeypatch):
+    from galtools.tools.audio_filter import cli
+
+    for raw, expected in [('', core.DEFAULT_THRESHOLD), ('6', 6.0),
+                          ('6.5秒', 6.5), ('12S', 12.0)]:
+        _feed(monkeypatch, [raw])
+        got = cli.ask_threshold()
+        assert got == expected
+        assert validate({'threshold': got}) == []
+
+
+def test_wizard_threshold_rejects_exactly_what_validate_rejects(monkeypatch):
+    from galtools.tools.audio_filter import cli
+
+    for bad in ('0', '-3', '0.0'):
+        _feed(monkeypatch, [bad, '6'])
+        assert cli.ask_threshold() == 6.0
+        assert validate({'threshold': float(bad)}) == [('threshold', '必须为正数')]
+    # 非数字在 GUI 侧由 bad_number 报「填数字」，validate 见不到它；向导这一侧
+    # 只管拒收重问。
+    _feed(monkeypatch, ['abc', '6'])
+    assert cli.ask_threshold() == 6.0
+
+
+def test_wizard_max_limit_matches_validate(monkeypatch):
+    from galtools.tools.audio_filter import cli
+
+    threshold = 6.0
+    for raw, expected in [('', None), ('15', 15.0), ('15.5秒', 15.5)]:
+        _feed(monkeypatch, [raw])
+        got = cli.ask_max_limit(threshold)
+        assert got == expected
+        assert validate({'threshold': threshold, 'max_limit': got}) == []
+    for bad, reason in [('0', '必须为正数'), ('-1', '必须为正数'),
+                        ('5', '必须大于筛选阈值'), ('6', '必须大于筛选阈值')]:
+        _feed(monkeypatch, [bad, '15'])
+        assert cli.ask_max_limit(threshold) == 15.0
+        assert validate({'threshold': threshold,
+                         'max_limit': float(bad)}) == [('max_limit', reason)]
+    _feed(monkeypatch, ['abc', '15'])
+    assert cli.ask_max_limit(threshold) == 15.0
+
+
 # ---------------- run ----------------
 def test_run_clears_scan_cache(tmp_path):
     """输出目录建在源目录内，跑完之后旧的扫描结果必然过期。"""
