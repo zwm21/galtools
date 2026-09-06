@@ -11,7 +11,7 @@ ref 至少含一行数据，只有表头的 ref 会让文件被判定为损坏�
 import os
 import re
 from ...core.paths import keep_drive_root
-from .model import ROLES, url_for
+from .model import ROLES, role_counts, url_for
 
 # 每人一页的列。前 8 列沿用旧脚本的表头与列宽（Title1/Cast1/As1 是原名，原名本就
 # 是拉丁字母时退回罗马字，不留空列），末尾新增 Role——角色主次是判断「这人在这部里
@@ -216,21 +216,13 @@ def _overview(wb, items, title, tname, font):
     _row(ws, 1, OVERVIEW_HEADERS)
     for row, item in enumerate(items, 2):
         staff = item.staff
-        counts = dict.fromkeys(ROLES, 0)
-        other = 0
-        for credit in item.credits:
-            if credit.role in counts:
-                counts[credit.role] += 1
-            else:
-                other += 1
         _put(ws, row, 1, staff.original or staff.name)
         _put(ws, row, 2, staff.name)
         _put(ws, row, 3, staff.sid, url_for(staff.sid), font)
         _put(ws, row, 4, len(item.vids))
         _put(ws, row, 5, len(item.credits))
-        for i, role in enumerate(ROLES):
-            _put(ws, row, 6 + i, counts[role])
-        _put(ws, row, 6 + len(ROLES), other)
+        for i, count in enumerate(role_counts(item.credits)):
+            _put(ws, row, 6 + i, count)
     _finish(ws, OVERVIEW_WIDTHS, len(items), tname)
 
 
@@ -347,7 +339,9 @@ def build(items, combos, path):
     many = len(items) > 2
 
     overview = sheet_title(used, OVERVIEW_SHEET)
-    index = sheet_title(used, COMBO_SHEET) if many else ''
+    # combos 为空是「不算共同出演」（声优库的名册导出就这么调：50 个人有 2^50 个
+    # 组合，根本不算），此时连索引页都不该有。只看人数会造出一张只有表头的空页。
+    index = sheet_title(used, COMBO_SHEET) if many and combos else ''
     planned = []
     for combo in combos if len(items) > 1 else ():
         if not many:

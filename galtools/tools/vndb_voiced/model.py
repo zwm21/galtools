@@ -139,6 +139,18 @@ class Combo:
     entries: list = field(default_factory=list)
 
 
+def role_counts(credits):
+    """按 ROLES 的顺序数角色主次，末位是 vndb 没标注（或标了新值）的条数。
+
+    概览页与名册摆的是同一组数字，数法只能有一份。
+    """
+    counts = [0] * (len(ROLES) + 1)
+    for credit in credits:
+        index = ROLES.index(credit.role) if credit.role in ROLES else len(ROLES)
+        counts[index] += 1
+    return counts
+
+
 def released_sort_key(released):
     """产出的排序键。
 

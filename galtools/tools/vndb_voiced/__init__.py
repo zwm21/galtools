@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
-"""vndb 声优出演表：抓 VNDB 上某个声优配过的全部角色，导出 Excel。
+"""vndb 声优出演表：抓 VNDB 上某个声优配过的全部角色，存进本地库并可导出 Excel。
 
 填两人以上时额外算出共同出演的作品（旧仓库里这是另一个脚本 compare_voiced_xlsx，
 需要先跑两次抓取再手动喂两个 xlsx 给它；这里合成一步）。三人以上时两两及以上的
 每个组合各出一页，页名是各人的罗马音，另有一张「组合」索引页。
+
+抓回来的东西有两个去处，各自一个开关：本地库（默认开，一人一个 json，见
+store.py）与 xlsx（默认关）。默认这么配是因为抓一次要十几秒到几分钟，而库里的
+数据用「声优库」工具随时能离线导出、离线算共同出演，不必为了看一眼再抓一遍。
 
 旧版抓 HTML，本版走官方 kana JSON API：更准（角色主次、别名、日文原名都是结构化
 字段，不靠 DOM 猜）也更快。三阶段抓取见 fetch.py。
@@ -17,7 +21,7 @@ from ...core.context import Cancelled
 from ...core.spec import (
     BOOL, DIR, TEXT, Field, PreviewResult, RunResult, Table, ToolSpec,
 )
-from . import api, fetch, xlsx
+from . import api, fetch, store, tables, xlsx
 from .model import url_for
 
 # 预计耗时用的经验系数：实测 288 部候选作品 11.8 秒（其中 /vn 翻页占 8.3 秒）。
@@ -76,41 +80,6 @@ def _candidate_table(problems):
                  title='改填其中一个 ID')
 
 
-def _common_table(items, common, title=None):
-    """共同出演：一行一部作品，每人一列各自配的角色。"""
-    rows = []
-    for entry in common:
-        vn_url = url_for(entry.vid)
-        row = [entry.released, (entry.title, vn_url), (entry.title_orig, vn_url)]
-        for casts in entry.casts:
-            # 一个人在同一部里配多个角色时，链接指向谁都不对，索性不加。
-            link = casts[0][1] if len(casts) == 1 else None
-            row.append((' / '.join(t for t, _ in casts), link))
-        rows.append(tuple(row))
-    return Table(columns=('发售日', 'Title', '日文原名')
-                         + tuple(xlsx.cast_columns(items)),
-                 rows=rows, title=title or '共同出演 %d 部' % len(common))
-
-
-def _credits_table(item):
-    """只有一个人时没有交集可算，摆他的全部出演记录。"""
-    rows = []
-    for c in item.credits:
-        vn_url, char_url = url_for(c.vid), url_for(c.cid)
-        rows.append((c.released, (c.title_orig, vn_url),
-                     (c.cast_orig, char_url),
-                     c.alias_orig, c.role))
-    return Table(columns=('发售日', 'Title', '角色', 'As', 'Role'), rows=rows,
-                 title='%s：%d 条出演记录' % (item.staff.label(),
-                                             len(item.credits)))
-
-
-def combo_names(items, combo):
-    """组合里各人的罗马音，摘要与索引页共用一种写法。"""
-    return '、'.join(items[i].staff.name or items[i].staff.sid
-                     for i in combo.members)
-
-
 def unique_people(resolutions):
     """按 sid 去重，返回 (保留的解析结果, 被合并掉的个数)。
 
@@ -127,21 +96,45 @@ def unique_people(resolutions):
     return out, len(resolutions) - len(out)
 
 
+def too_many_people(count):
+    """人数超上限时的那条消息，没超就是空串。
+
+    「声优库」的离线导出受同一条约束：贵的不是抓取而是写出 2^N 张工作表，所以
+    两个工具共用这一份规则，免得一边放宽了另一边还拦着。
+    """
+    if count <= MAX_TARGETS:
+        return ''
+    return ('最多 %d 个人：%d 个人有 %d 个两两及以上的组合，工作簿会大到没法看'
+            % (MAX_TARGETS, count, 2 ** count - count - 1))
+
+
 def validate(params):
-    """每敲一个键都会跑，只做纯本地判断，绝不联网。"""
+    """每敲一个键都会跑，只做纯本地判断，绝不联网。
+
+    两个目录都是「条件必填」，所以 Field 那边写的是 required=False：写成
+    required=True 的话 ToolPage.validation_errors 会在跑到这里之前就报「必填」，
+    连预览都发不出去——而开关关掉的那一个本来就不用填。
+    """
     errors = []
-    out_dir = params.get('out_dir')
-    if out_dir and not os.path.isdir(out_dir):
-        errors.append(('out_dir', '目录不存在或不可访问'))
+    save_db, export = bool(params.get('save_db')), bool(params.get('export'))
+    if not save_db and not export:
+        # 整表级错误（key 为空串）：两个开关都关掉时抓完什么都不留，不该让用户
+        # 等几分钟才发现。
+        errors.append(('', '「存入本地库」和「导出 Excel」至少要有一个，'
+                           '否则抓完什么都不留。'))
+    for key, on, label in (('db_dir', save_db, '存入本地库'),
+                           ('out_dir', export, '导出 Excel')):
+        value = params.get(key)
+        if value and not os.path.isdir(value):
+            errors.append((key, '目录不存在或不可访问'))
+        elif on and not value:
+            errors.append((key, '勾了「%s」就要填这里' % label))
     raw = (params.get('staff') or '').strip()
     targets = fetch.parse_targets(raw)
     if raw and not targets:
         errors.append(('staff', '没解析出任何目标'))
     if len(targets) > MAX_TARGETS:
-        errors.append(('staff', '最多 %d 个人：%d 个人有 %d 个两两及以上的组合，'
-                                '工作簿会大到没法看'
-                                % (MAX_TARGETS, len(targets),
-                                   2 ** len(targets) - len(targets) - 1)))
+        errors.append(('staff', too_many_people(len(targets))))
     for target in targets:
         kind, value = fetch.classify(target)
         if kind == 'bad':
@@ -187,9 +180,12 @@ def preview(params, ctx):
                              warnings=['没有一个目标能定位到具体的人。'])
     if problems:
         warnings.append('有 %d 个目标没定位到人，先改对再开始。' % len(problems))
-    lines.append('共 %d 人，预计 %s；输出 %s'
-                 % (len(done), eta_text(total_vns, len(done)),
-                    xlsx.workbook_name([r.staff for r in done])))
+    tail = '共 %d 人，预计 %s' % (len(done), eta_text(total_vns, len(done)))
+    if params.get('save_db'):
+        tail += '；存入 %s' % params.get('db_dir')
+    if params.get('export'):
+        tail += '；导出 %s' % xlsx.workbook_name([r.staff for r in done])
+    lines.append(tail)
     if len(done) == 1:
         warnings.append('只有一个人，不会有共同出演页。')
     elif len(done) > 2:
@@ -204,7 +200,13 @@ def preview(params, ctx):
 
 
 def run(params, ctx):
-    """先把输出目录备好再抓，一无所获时把自己建的那个目录收回去。"""
+    """先把导出目录备好再抓，一无所获时把自己建的那个目录收回去。
+
+    不导出时整段跳过：只存库的那一次没有 xlsx 要落地，而库目录 validate 已经
+    要求它本来就存在。
+    """
+    if not params.get('export'):
+        return _run(params, ctx)
     out_dir = params.get('out_dir')
     target = xlsx.target_dir(out_dir)
     # 抓之前先把目录建出来。GUI 侧 validate 已经拦过一道，命令行的 -o 没人拦：
@@ -213,10 +215,10 @@ def run(params, ctx):
     try:
         os.makedirs(target, exist_ok=True)
     except OSError as e:
-        return RunResult(summary='\n输出目录不可用，没有抓取：%s' % e,
-                         failures=[('输出目录', str(e))])
+        return RunResult(summary='\n导出目录不可用，没有抓取：%s' % e,
+                         failures=[('导出目录', str(e))])
     try:
-        return _run(params, ctx, out_dir)
+        return _run(params, ctx)
     finally:
         # 五个出口都从这里过，包括 Cancelled（它是 BaseException）。目录是我们刚
         # 建的才收回去——不然「定位不到人」「取消」这些一无所获的结局会在盘上留个
@@ -230,7 +232,24 @@ def run(params, ctx):
                 pass
 
 
-def _run(params, ctx, out_dir):
+def _save_to_db(db_dir, ctx, items):
+    """把抓到的人写进本地库，返回 (写成功的 sid, 失败项)。
+
+    一个人写失败只报他自己：库是一人一个文件，没有「写了一半」的中间状态。
+    """
+    saved, failures = [], []
+    for item in items:
+        try:
+            store.write_person(db_dir, item)
+        except (store.BadFile, OSError) as e:
+            ctx.log('%s 没写进本地库：%s' % (item.staff.label(), e), 'warn')
+            failures.append((item.staff.label(), str(e)))
+        else:
+            saved.append(item.staff.sid)
+    return saved, failures
+
+
+def _run(params, ctx):
     """命令行从不预览，所以 run 自己也要解析目标、自己也要抓。"""
     _apply_refresh(params, ctx)
     try:
@@ -263,14 +282,13 @@ def _run(params, ctx, out_dir):
                          failures=failures)
 
     groups = fetch.combos(items) if len(items) > 1 else []
-    ctx.log('正在写 Excel…')
-    try:
-        path = xlsx.save(items, groups, out_dir)
-    except OSError as e:
-        # 先挡不掉的那几种：磁盘满、整条路径过了 260、目标文件正被 Excel 占着。
-        # 抓回来的东西还在 ctx.session 里，换个目录再点一次「开始」不必重抓。
-        return RunResult(summary='\n写 Excel 失败，没有输出文件：%s' % e,
-                         failures=failures + [('写 Excel', str(e))])
+    warnings = []
+    if unresolved:
+        warnings.append('%d 个目标没定位到人，已跳过。' % len(unresolved))
+    if hard:
+        warnings.append('%d 个人抓取失败，已跳过。' % len(hard))
+    if merged:
+        warnings.append('%d 个目标指向同一个人，已合并。' % merged)
 
     lines = ['\n========== 执行结果 ==========']
     for item in items:
@@ -284,39 +302,52 @@ def _run(params, ctx, out_dir):
                      % (len(shared), len(groups)))
         for combo in shared[:MAX_LISTED_COMBOS]:
             lines.append('  %s : %d 部'
-                         % (combo_names(items, combo), len(combo.entries)))
+                         % (tables.combo_names(items, combo),
+                            len(combo.entries)))
         if len(shared) > MAX_LISTED_COMBOS:
             lines.append('  …其余 %d 个见工作簿里的「组合」页'
                          % (len(shared) - MAX_LISTED_COMBOS))
-    lines += ['输出文件 : %s' % path, '=' * 30, '全部完成。']
 
-    warnings = []
-    if unresolved:
-        warnings.append('%d 个目标没定位到人，已跳过。' % len(unresolved))
-    if hard:
-        warnings.append('%d 个人抓取失败，已跳过。' % len(hard))
-    if merged:
-        warnings.append('%d 个目标指向同一个人，已合并。' % merged)
-    if groups:
-        # 屏幕上只摆得下一张表。groups 按人数降序，优先摆全员那一档，但三人以上
-        # 全员同时出演经常是空的——那就往下取第一个有交集的组合，并在标题里写清
-        # 是哪一档，否则用户明明有几个组合有交集却看到一屏空白。
-        shown = next((c for c in groups if c.entries), groups[0])
-        title = None if len(shown.members) == len(items) else (
-            '%s 共同出演 %d 部' % (combo_names(items, shown), len(shown.entries)))
-        table = _common_table([items[i] for i in shown.members], shown.entries,
-                              title)
-    else:
-        table = _credits_table(items[0])
-    return RunResult(summary='\n'.join(lines), output_paths=[path],
-                     warnings=warnings, failures=failures, table=table)
+    outputs = []
+    # 先写库再写 xlsx：写 xlsx 会因为盘满、路径过 260、文件正被 Excel 占着而失败，
+    # 而抓一次要十几秒到几分钟，那几分钟不该连库都没进。
+    if params.get('save_db'):
+        db_dir = params.get('db_dir')
+        ctx.log('正在写本地库…')
+        saved, refused = _save_to_db(db_dir, ctx, items)
+        failures += refused
+        if refused:
+            warnings.append('%d 个人没写进本地库。' % len(refused))
+        if saved:
+            outputs.append(db_dir)
+        lines.append('本地库 : %d/%d 人 -> %s' % (len(saved), len(items), db_dir))
+    if params.get('export'):
+        ctx.log('正在写 Excel…')
+        try:
+            path = xlsx.save(items, groups, params.get('out_dir'))
+        except OSError as e:
+            # 先挡不掉的那几种：磁盘满、整条路径过了 260、目标文件正被 Excel 占着。
+            # 抓回来的东西还在 ctx.session 里，换个目录再点一次「开始」不必重抓。
+            lines.append('写 Excel 失败，没有导出文件：%s' % e)
+            return RunResult(summary='\n'.join(lines), output_paths=outputs,
+                             warnings=warnings,
+                             failures=failures + [('写 Excel', str(e))],
+                             table=tables.result_table(items, groups))
+        # _open_outputs 只打开第一个存在的路径，xlsx 要排在库目录前面。
+        outputs.insert(0, path)
+        lines.append('输出文件 : %s' % path)
+    lines += ['=' * 30, '全部完成。']
+    return RunResult(summary='\n'.join(lines), output_paths=outputs,
+                     warnings=warnings, failures=failures,
+                     table=tables.result_table(items, groups))
 
 
 TOOL = ToolSpec(
     id='vndb_voiced',
     name='vndb 声优出演表',
     category='资料',
-    description='抓 VNDB 上某个声优配过的全部角色，导出 Excel：一页概览 + 每人'
+    description='抓 VNDB 上某个声优配过的全部角色，默认存进本地库（一人一个 json，'
+                '「声优库」工具读的就是它），也可以直接导出 Excel：一页概览 + 每人'
                 '一页明细。填两人以上时额外算出共同出演的作品，三人以上按两两'
                 '及以上的组合各出一页。',
     fields=(
@@ -324,9 +355,19 @@ TOOL = ToolSpec(
               help='id（s367）、声优页网址或名字，多个用逗号分隔，最多 8 个人。'
                    '名字有歧义时会列出候选，改填其中的 id 即可。',
               placeholder='s367, s131'),
-        Field(key='out_dir', kind=DIR, label='输出目录',
+        Field(key='save_db', kind=BOOL, label='存入本地库', default=True,
+              required=False,
+              help='一人一个 json 写进库目录，同一个人再抓一次就整份换掉。'),
+        Field(key='db_dir', kind=DIR, label='库目录', required=False,
+              help='本地声优库的位置，与「声优库」工具填同一个目录。要先存在。',
+              placeholder='勾了「存入本地库」就要填'),
+        Field(key='export', kind=BOOL, label='导出 Excel', default=False,
+              required=False,
+              help='另外写一份 xlsx。默认关着：进了库的人用「声优库」随时能离线'
+                   '导出，不必为了一份表格重抓。'),
+        Field(key='out_dir', kind=DIR, label='导出目录', required=False,
               help='xlsx 写到这里。同名文件不覆盖，自动加序号。',
-              placeholder='可把文件夹拖到这里'),
+              placeholder='勾了「导出 Excel」就要填'),
         Field(key='refresh', kind=BOOL, label='重新抓取', default=False,
               rescan=True, required=False,
               help='忽略本次会话已抓到的结果，重新打一遍 vndb 的 API。'),

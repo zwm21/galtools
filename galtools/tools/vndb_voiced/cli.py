@@ -5,6 +5,10 @@
 或多个参数），行为与 GUI 一致：两人会多出一页共同出演，三人以上按两两及以上的
 组合各出一页。
 
+不带 --db 时只导出 xlsx，与旧脚本一模一样；--db 目录 追加存库，再配 --no-export
+就只存库不写表格。GUI 的默认值正相反（默认存库、默认不导出），但两边的规则都由
+ToolSpec.validate 一份说了算。
+
 setup_console 与 msvcrt 只出现在这条路径上，import 时不执行任何副作用。
 """
 import argparse
@@ -30,16 +34,29 @@ def check_targets(raw):
     """返回 (目标列表, 错误消息)。
 
     规则不自己写一份，直接调 ToolSpec.validate：人数上限这类规则以前只装在 GUI
-    那一侧，命令行喂 20 个 id 会一路跑到抓完再去枚举一百万个组合。out_dir 不传，
-    validate 里那条目录检查就自动跳过——命令行的输出目录由 save 现建。
+    那一侧，命令行喂 20 个 id 会一路跑到抓完再去枚举一百万个组合。这里只看 staff
+    那几条，别的键交给 check_options。
     """
     targets = fetch.parse_targets(raw)
     if not targets:
         return [], '没解析出任何目标。'
-    for key, message in validate({'staff': raw}):
+    for key, message in validate({'staff': raw, 'export': True}):
         if key == 'staff':
             return [], message
     return targets, ''
+
+
+def check_options(params):
+    """把整份参数喂给 validate，返回第一条错误消息（没有就是空串）。
+
+    跳过 staff（check_targets 的活，交互模式下先问的就是它）与 out_dir：GUI 要求
+    导出目录已经存在，而命令行的 -o 一向是现建的。库目录不同，它必须已经存在——
+    打错一个字就悄悄开一个新库，等到发现时数据已经分散在两处了。
+    """
+    for key, message in validate(params):
+        if key not in ('staff', 'out_dir'):
+            return message
+    return ''
 
 
 def ask_targets():
@@ -79,6 +96,12 @@ def main():
                     help='staff id（s367）、声优页网址或名字；缺省时进入交互模式')
     ap.add_argument('-o', '--output', default='.',
                     help='输出目录或 .xlsx 路径，默认当前目录')
+    # GUI 那边默认存库、不导出，命令行反过来：不带 --db 的调用与旧脚本一模一样，
+    # 已经写进批处理的那些不会因为多了个库而改行为。规则仍然只有 validate 一份。
+    ap.add_argument('--db', metavar='目录',
+                    help='同时把抓到的人存进这个本地声优库（目录要已存在）')
+    ap.add_argument('--no-export', action='store_true',
+                    help='只存库，不写 xlsx；要配 --db 用')
     ap.add_argument('--refresh', action='store_true',
                     help='忽略缓存重新抓取（命令行每次都是新进程，一般用不到）')
     args = ap.parse_args()
@@ -94,9 +117,14 @@ def main():
         print('=' * 46)
         raw = ask_targets()
 
+    params = {'staff': raw, 'out_dir': args.output, 'export': not args.no_export,
+              'save_db': bool(args.db), 'db_dir': args.db or '',
+              'refresh': args.refresh}
+    error = check_options(params)
+    if error:
+        ap.error(error)
     ctx = ConsoleContext()
-    result = run({'staff': raw, 'out_dir': args.output,
-                  'refresh': args.refresh}, ctx)
+    result = run(params, ctx)
     print(result.summary)
     # 一个文件都没写出来时以非零退出。ApiError 那条路径本来就这样，而「目标全都
     # 定位不到人」「输出目录不可用」同样是什么都没产出，exit 0 会让调用它的脚本

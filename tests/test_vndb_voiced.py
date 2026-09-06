@@ -17,7 +17,7 @@ import pytest
 from galtools.core.context import Cancelled, RunContext
 from galtools.core.spec import RunResult
 from galtools.tools import vndb_voiced as tool
-from galtools.tools.vndb_voiced import api, cli, fetch, xlsx
+from galtools.tools.vndb_voiced import api, cli, fetch, store, tables, xlsx
 from galtools.tools.vndb_voiced.model import (
     Common, Credit, Resolution, Staff, StaffCredits, label, released_sort_key,
     url_for,
@@ -436,6 +436,18 @@ def vndb(fail_vn_for=None):
             return page([VN_ROWS[v] for v in sorted(vids)], count=len(vids))
         raise AssertionError('没预料到的 path: %r' % path)
     return handler
+
+
+def args(staff, out_dir=None, **kw):
+    """一份完整的参数字典。
+
+    GUI 的表单总会把每个字段都填上，手写字典就容易漏掉开关——而 run 是靠开关决定
+    往哪儿写的。默认导出、不存库：绝大多数用例验的是工作簿。
+    """
+    params = {'staff': staff, 'export': True, 'save_db': False, 'db_dir': '',
+              'out_dir': '' if out_dir is None else str(out_dir)}
+    params.update(kw)
+    return params
 
 
 # ---------------- 解析 ----------------
@@ -945,6 +957,18 @@ def test_build_single_person_has_no_common_sheet(tmp_path):
     assert os.path.basename(again) == 'vndb_S1_voiced_1.xlsx'
 
 
+def test_no_combos_means_no_combo_index_sheet(tmp_path):
+    """声优库的名册导出传 combos=[]：50 个人的组合数是 2^50，根本不算。
+    以前只看人数，于是多出一张只有表头的空「组合」页。"""
+    pytest.importorskip('openpyxl')
+    from openpyxl import load_workbook
+
+    people = [person('s%d' % i, [credit('v1', 'A', 'c1')]) for i in (1, 2, 3)]
+    wb = load_workbook(xlsx.build(people, [], str(tmp_path / '名册.xlsx')))
+    check_excel_tables(wb)
+    assert wb.sheetnames == ['概览', 'S1 s1', 'S2 s2', 'S3 s3']
+
+
 def test_save_accepts_an_explicit_xlsx_path(tmp_path):
     pytest.importorskip('openpyxl')
     target = tmp_path / 'sub' / '我的.xlsx'
@@ -981,19 +1005,36 @@ def test_clean_strips_control_chars():
 
 # ---------------- 工具层 ----------------
 def test_validate_is_offline_and_reports_first_bad_target(tmp_path):
-    assert tool.validate({'staff': 's1', 'out_dir': str(tmp_path)}) == []
-    errors = dict(tool.validate({'staff': 'v3, c9',
-                                 'out_dir': str(tmp_path / '没有这个目录')}))
+    assert tool.validate(args('s1', tmp_path)) == []
+    errors = dict(tool.validate(args('v3, c9', tmp_path / '没有这个目录')))
     assert '目录不存在' in errors['out_dir']
     assert '作品' in errors['staff']          # 只报第一个坏目标
-    assert dict(tool.validate({'staff': '、、'}))['staff'] == '没解析出任何目标'
+    assert dict(tool.validate(args('、、', tmp_path)))['staff'] == '没解析出任何目标'
 
 
-def test_validate_caps_the_number_of_people():
+def test_validate_wants_a_destination_for_what_it_fetches(tmp_path):
+    """两个开关都关掉时抓完什么都不留，这是整表级错误（key 是空串）。"""
+    assert dict(tool.validate(args('s1', tmp_path, export=False)))[''] != ''
+    assert tool.validate(args('s1', save_db=True,
+                              db_dir=str(tmp_path), export=False)) == []
+
+
+def test_validate_asks_for_the_directory_the_switch_needs(tmp_path):
+    """两个目录都是条件必填：勾了才要填，没勾的那个空着不算错。"""
+    errors = dict(tool.validate(args('s1', save_db=True, export=True)))
+    assert '勾了「存入本地库」' in errors['db_dir']
+    assert '勾了「导出 Excel」' in errors['out_dir']
+    # 库目录必须已经存在：现建的话打错一个字就悄悄开了第二个库。
+    errors = dict(tool.validate(args('s1', tmp_path, save_db=True,
+                                     db_dir=str(tmp_path / '还没有'))))
+    assert '目录不存在' in errors['db_dir']
+
+
+def test_validate_caps_the_number_of_people(tmp_path):
     ok = ', '.join('s%d' % i for i in range(1, tool.MAX_TARGETS + 1))
-    assert tool.validate({'staff': ok}) == []
+    assert tool.validate(args(ok, tmp_path)) == []
     too_many = ok + ', s99'
-    message = dict(tool.validate({'staff': too_many}))['staff']
+    message = dict(tool.validate(args(too_many, tmp_path)))['staff']
     assert '最多 %d 个人' % tool.MAX_TARGETS in message
     assert '502 个两两及以上的组合' in message      # 2^9 - 9 - 1
 
@@ -1020,8 +1061,7 @@ def test_refresh_clears_cache_only_once_per_toggle():
 
 def test_preview_lists_each_person(monkeypatch, tmp_path):
     FakeApi(vndb()).install(monkeypatch)
-    result = tool.preview({'staff': 's1, s2', 'out_dir': str(tmp_path)},
-                          RunContext())
+    result = tool.preview(args('s1, s2', tmp_path), RunContext())
     assert result.ok
     assert 'アルファ (Alpha One) s1：角色 2，作品 ≤2' in result.summary
     assert '共 2 人，预计' in result.summary
@@ -1049,8 +1089,7 @@ def test_preview_warns_about_the_lonely_single_person(monkeypatch):
 
 def test_preview_reports_the_combinations_for_three_people(monkeypatch, tmp_path):
     FakeApi(vndb()).install(monkeypatch)
-    result = tool.preview({'staff': 's1, s2, s3', 'out_dir': str(tmp_path)},
-                          RunContext())
+    result = tool.preview(args('s1, s2, s3', tmp_path), RunContext())
     assert result.ok
     assert '共同出演_Alpha_One_Beta_Two_Gamma_Three_3人.xlsx' in result.summary
     assert '共同出演表：4 个组合' in result.summary
@@ -1061,7 +1100,7 @@ def test_run_writes_a_workbook_and_reuses_the_preview_cache(monkeypatch, tmp_pat
     pytest.importorskip('openpyxl')
     fake = FakeApi(vndb()).install(monkeypatch)
     ctx = RunContext()
-    params = {'staff': 's1, s2', 'out_dir': str(tmp_path)}
+    params = args('s1, s2', tmp_path)
     tool.preview(params, ctx)
     before = len(fake.calls)             # 解析 2 + count 4
     result = tool.run(params, ctx)
@@ -1082,7 +1121,7 @@ def test_run_skips_targets_it_cannot_resolve(monkeypatch, tmp_path):
     pytest.importorskip('openpyxl')
     FakeApi(vndb()).install(monkeypatch)
     ctx = CountingCtx(after=10 ** 6)
-    result = tool.run({'staff': 's1, s9', 'out_dir': str(tmp_path)}, ctx)
+    result = tool.run(args('s1, s9', tmp_path), ctx)
     assert result.failures == [('s9', 'vndb 上没有 s9 这个人')]
     assert result.warnings == ['1 个目标没定位到人，已跳过。']
     assert os.path.exists(result.output_paths[0])
@@ -1091,7 +1130,7 @@ def test_run_skips_targets_it_cannot_resolve(monkeypatch, tmp_path):
 
 def test_run_without_anyone_writes_nothing(monkeypatch, tmp_path):
     FakeApi(vndb()).install(monkeypatch)
-    result = tool.run({'staff': 's9', 'out_dir': str(tmp_path)}, RunContext())
+    result = tool.run(args('s9', tmp_path), RunContext())
     assert result.output_paths == []
     assert len(result.failures) == 1
     assert list(tmp_path.iterdir()) == []
@@ -1100,7 +1139,7 @@ def test_run_without_anyone_writes_nothing(monkeypatch, tmp_path):
 def test_run_reports_a_persons_fetch_failure(monkeypatch, tmp_path):
     pytest.importorskip('openpyxl')
     FakeApi(vndb(fail_vn_for='s2')).install(monkeypatch)
-    result = tool.run({'staff': 's1, s2', 'out_dir': str(tmp_path)}, RunContext())
+    result = tool.run(args('s1, s2', tmp_path), RunContext())
     assert [name for name, _ in result.failures] == ['ベータ (Beta Two) s2']
     assert result.warnings == ['1 个人抓取失败，已跳过。']
     # 只剩一个人了，就不该再有共同出演页。
@@ -1116,7 +1155,7 @@ def test_run_cancelled_carries_an_empty_partial(monkeypatch, tmp_path):
 
     monkeypatch.setattr(fetch, 'ensure_credits', boom)
     with pytest.raises(Cancelled) as caught:
-        tool.run({'staff': 's1', 'out_dir': str(tmp_path)}, RunContext())
+        tool.run(args('s1', tmp_path), RunContext())
     assert '取消' in caught.value.partial.summary
     assert list(tmp_path.iterdir()) == []
 
@@ -1127,11 +1166,10 @@ def test_run_refuses_a_bad_output_dir_before_spending_a_request(monkeypatch,
     fake = FakeApi(vndb()).install(monkeypatch)
     blocker = tmp_path / 'not_a_dir'
     blocker.write_text('x', encoding='utf-8')      # 拿文件当父目录，makedirs 必炸
-    result = tool.run({'staff': 's1', 'out_dir': str(blocker / 'sub')},
-                      RunContext())
-    assert '输出目录不可用' in result.summary
+    result = tool.run(args('s1', blocker / 'sub'), RunContext())
+    assert '导出目录不可用' in result.summary
     assert result.output_paths == []
-    assert [name for name, _ in result.failures] == ['输出目录']
+    assert [name for name, _ in result.failures] == ['导出目录']
     assert fake.calls == []                        # 一个请求都没打出去
 
 
@@ -1141,7 +1179,7 @@ def test_run_takes_back_the_directory_it_made_when_it_wrote_nothing(monkeypatch,
     而「定位不到人」「每个人都抓失败」「取消」这几个出口都不写文件。"""
     fake = FakeApi(vndb()).install(monkeypatch)
     fresh = tmp_path / 'brand_new'
-    result = tool.run({'staff': 's9', 'out_dir': str(fresh)}, RunContext())
+    result = tool.run(args('s9', fresh), RunContext())
 
     assert result.output_paths == []
     assert not fresh.exists()
@@ -1158,7 +1196,7 @@ def test_run_takes_back_the_directory_on_cancel_too(monkeypatch, tmp_path):
     monkeypatch.setattr(fetch, 'ensure_credits', boom)
     fresh = tmp_path / 'brand_new'
     with pytest.raises(Cancelled):
-        tool.run({'staff': 's1', 'out_dir': str(fresh)}, RunContext())
+        tool.run(args('s1', fresh), RunContext())
     assert not fresh.exists()
 
 
@@ -1169,7 +1207,7 @@ def test_run_never_touches_a_directory_that_was_already_there(monkeypatch,
     FakeApi(vndb()).install(monkeypatch)
     mine = tmp_path / 'mine'
     mine.mkdir()
-    tool.run({'staff': 's9', 'out_dir': str(mine)}, RunContext())
+    tool.run(args('s9', mine), RunContext())
     assert mine.is_dir()
 
 
@@ -1178,7 +1216,7 @@ def test_run_keeps_the_directory_when_the_workbook_lands_in_it(monkeypatch,
     pytest.importorskip('openpyxl')
     FakeApi(vndb()).install(monkeypatch)
     fresh = tmp_path / 'brand_new'
-    result = tool.run({'staff': 's1', 'out_dir': str(fresh)}, RunContext())
+    result = tool.run(args('s1', fresh), RunContext())
     assert fresh.is_dir() and os.path.exists(result.output_paths[0])
 
 
@@ -1192,25 +1230,95 @@ def test_run_reports_a_write_failure_instead_of_a_traceback(monkeypatch,
         raise OSError(28, 'No space left on device')
 
     monkeypatch.setattr(xlsx, 'save', boom)
-    result = tool.run({'staff': 's1, s2', 'out_dir': str(tmp_path)},
-                      RunContext())
+    result = tool.run(args('s1, s2', tmp_path), RunContext())
     assert '写 Excel 失败' in result.summary
     assert result.output_paths == []
     assert [name for name, _ in result.failures] == ['写 Excel']
     assert list(tmp_path.iterdir()) == []
 
 
+# ---------------- 本地库 ----------------
+def test_run_saves_to_the_db_and_can_skip_the_workbook(monkeypatch, tmp_path):
+    """GUI 的默认那一档：存库、不导出。库目录必须本来就存在，run 不替它建。"""
+    FakeApi(vndb()).install(monkeypatch)
+    result = tool.run(args('s1, s2', save_db=True, db_dir=str(tmp_path),
+                           export=False), RunContext())
+    assert sorted(os.listdir(str(tmp_path))) == ['s1.json', 's2.json']
+    assert result.output_paths == [str(tmp_path)]
+    assert result.failures == []
+    assert '本地库 : 2/2 人 -> %s' % tmp_path in result.summary
+    assert '共同出演 : 1 部' in result.summary      # 摘要与表格照旧
+    back = store.read_person(str(tmp_path), 's1')
+    assert [c.cast for c in back.credits] == ['Chara One', 'Chara Two']
+
+
+def test_run_lists_the_workbook_before_the_db_dir(monkeypatch, tmp_path):
+    """「打开输出」只开 output_paths 里第一个存在的路径，xlsx 要排在库目录前面。"""
+    pytest.importorskip('openpyxl')
+    FakeApi(vndb()).install(monkeypatch)
+    db, out = tmp_path / 'db', tmp_path / 'out'
+    db.mkdir()
+    out.mkdir()
+    result = tool.run(args('s1', out, save_db=True, db_dir=str(db)),
+                      RunContext())
+    assert result.output_paths == [str(out / 'vndb_Alpha_One_voiced.xlsx'),
+                                  str(db)]
+    assert os.listdir(str(db)) == ['s1.json']
+
+
+def test_a_workbook_failure_does_not_lose_the_db(monkeypatch, tmp_path):
+    """先写库再写 xlsx：抓了几分钟，不该因为文件正被 Excel 占着连库都没进。"""
+    FakeApi(vndb()).install(monkeypatch)
+
+    def boom(*_args, **_kwargs):
+        raise OSError(13, 'Permission denied')
+
+    monkeypatch.setattr(xlsx, 'save', boom)
+    db = tmp_path / 'db'
+    db.mkdir()
+    result = tool.run(args('s1', tmp_path, save_db=True, db_dir=str(db)),
+                      RunContext())
+    assert os.listdir(str(db)) == ['s1.json']
+    assert result.output_paths == [str(db)]
+    assert '写 Excel 失败' in result.summary
+    assert [n for n, _ in result.failures] == ['写 Excel']
+
+
+def test_a_persons_db_write_failure_only_blames_himself(monkeypatch, tmp_path):
+    """库是一人一个文件，没有「写了一半」的整体状态。"""
+    FakeApi(vndb()).install(monkeypatch)
+    real = store.write_person
+
+    def picky(db_dir, item, **kw):
+        if item.staff.sid == 's2':
+            raise OSError(28, 'No space left on device')
+        return real(db_dir, item, **kw)
+
+    monkeypatch.setattr(store, 'write_person', picky)
+    result = tool.run(args('s1, s2', save_db=True, db_dir=str(tmp_path),
+                           export=False), RunContext())
+    assert os.listdir(str(tmp_path)) == ['s1.json']
+    assert [n for n, _ in result.failures] == ['ベータ (Beta Two) s2']
+    assert result.warnings == ['1 个人没写进本地库。']
+    assert '本地库 : 1/2 人' in result.summary
+
+
 def test_tool_spec_fields_match_what_run_reads():
     keys = {f.key for f in tool.TOOL.fields}
-    assert keys == {'staff', 'out_dir', 'refresh'}
+    assert keys == {'staff', 'save_db', 'db_dir', 'export', 'out_dir', 'refresh'}
     assert [f.key for f in tool.TOOL.fields if f.rescan] == ['staff', 'refresh']
+    # 两个目录都是条件必填，写成 required=True 会让 ToolPage 在 validate 之前
+    # 就报「必填」，连预览都发不出去。
+    assert [f.key for f in tool.TOOL.fields if f.required] == ['staff']
+    assert dict((f.key, f.default) for f in tool.TOOL.fields
+                if f.kind == 'bool') == {'save_db': True, 'export': False,
+                                         'refresh': False}
 
 
 # ---------------- 结果表格 ----------------
 def test_preview_table_lists_the_people_with_clickable_ids(monkeypatch, tmp_path):
     FakeApi(vndb()).install(monkeypatch)
-    table = tool.preview({'staff': 's1, s2', 'out_dir': str(tmp_path)},
-                         RunContext()).table
+    table = tool.preview(args('s1, s2', tmp_path), RunContext()).table
     assert table.columns == ('声优', '罗马字', 'ID', '角色数', '作品数 ≤')
     assert table.rows[0] == ('アルファ', 'Alpha One',
                              ('s1', 'https://vndb.org/s1'), 2, 2)
@@ -1233,8 +1341,7 @@ def test_preview_without_target_has_no_table():
 def test_run_table_is_the_common_works(monkeypatch, tmp_path):
     pytest.importorskip('openpyxl')
     FakeApi(vndb()).install(monkeypatch)
-    table = tool.run({'staff': 's1, s2', 'out_dir': str(tmp_path)},
-                     RunContext()).table
+    table = tool.run(args('s1, s2', tmp_path), RunContext()).table
     assert table.columns == ('发售日', 'Title', '日文原名', 'Alpha One', 'Beta Two')
     assert table.title == '共同出演 1 部'
     assert table.rows == [('1995', ('Game One', 'https://vndb.org/v1'),
@@ -1249,15 +1356,14 @@ def test_common_table_falls_back_when_a_title_has_no_original():
     items = [person('s1', []), person('s2', [])]
     common = [Common(vid='v1', title='Game One', released='1995',
                      casts=[[('Chara', url_for('c1'))], [('Bee', url_for('c3'))]])]
-    row = tool._common_table(items, common).rows[0]
+    row = tables.common_table(items, common).rows[0]
     assert row[2] == ('Game One', 'https://vndb.org/v1')
 
 
 def test_run_table_falls_back_to_one_persons_credits(monkeypatch, tmp_path):
     pytest.importorskip('openpyxl')
     FakeApi(vndb()).install(monkeypatch)
-    table = tool.run({'staff': 's1', 'out_dir': str(tmp_path)},
-                     RunContext()).table
+    table = tool.run(args('s1', tmp_path), RunContext()).table
     assert table.columns == ('发售日', 'Title', '角色', 'As', 'Role')
     assert table.title == 'アルファ (Alpha One) s1：2 条出演记录'
     assert [r[2] for r in table.rows] == [('キャラ壱', 'https://vndb.org/c1'),
@@ -1270,8 +1376,7 @@ def test_run_writes_every_combination_for_three_people(monkeypatch, tmp_path):
     from openpyxl import load_workbook
 
     FakeApi(vndb()).install(monkeypatch)
-    result = tool.run({'staff': 's1, s2, s3', 'out_dir': str(tmp_path)},
-                      RunContext())
+    result = tool.run(args('s1, s2, s3', tmp_path), RunContext())
     assert os.path.basename(result.output_paths[0]) == (
         '共同出演_Alpha_One_Beta_Two_Gamma_Three_3人.xlsx')
     assert '共同出演 : 4 个组合有交集（共 4 个组合）' in result.summary
@@ -1295,8 +1400,7 @@ def test_same_person_named_twice_is_merged(monkeypatch, tmp_path):
     from openpyxl import load_workbook
 
     fake = FakeApi(vndb()).install(monkeypatch)
-    result = tool.run({'staff': 's1, Alpha One', 'out_dir': str(tmp_path)},
-                      RunContext())
+    result = tool.run(args('s1, Alpha One', tmp_path), RunContext())
     assert os.path.basename(result.output_paths[0]) == 'vndb_Alpha_One_voiced.xlsx'
     wb = load_workbook(result.output_paths[0])
     assert wb.sheetnames == ['概览', 'アルファ s1']
@@ -1304,7 +1408,7 @@ def test_same_person_named_twice_is_merged(monkeypatch, tmp_path):
 
     # 抓取次数与只填一次时一致，不再白打一倍
     once = FakeApi(vndb()).install(monkeypatch)
-    tool.run({'staff': 's1', 'out_dir': str(tmp_path)}, RunContext())
+    tool.run(args('s1', tmp_path), RunContext())
     resolve_calls = len([c for c in fake.calls if c[0] == 'staff'])
     assert len([c for c in fake.calls if c[0] != 'staff']) == \
         len([c for c in once.calls if c[0] != 'staff'])
@@ -1313,12 +1417,11 @@ def test_same_person_named_twice_is_merged(monkeypatch, tmp_path):
 
 def test_preview_merges_the_duplicate_and_says_so(monkeypatch, tmp_path):
     FakeApi(vndb()).install(monkeypatch)
-    result = tool.preview({'staff': 's1, Alpha One', 'out_dir': str(tmp_path)},
-                          RunContext())
+    result = tool.preview(args('s1, Alpha One', tmp_path), RunContext())
     assert result.ok
     assert result.summary.splitlines() == [
         'アルファ (Alpha One) s1：角色 2，作品 ≤2',
-        '共 1 人，预计 约 5 秒；输出 vndb_Alpha_One_voiced.xlsx']
+        '共 1 人，预计 约 5 秒；导出 vndb_Alpha_One_voiced.xlsx']
     assert '有 1 个目标指向同一个人，已合并。' in result.warnings
     assert len(result.table.rows) == 1
 
@@ -1326,12 +1429,12 @@ def test_preview_merges_the_duplicate_and_says_so(monkeypatch, tmp_path):
 def test_api_errors_are_shown_as_a_sentence_not_a_traceback(monkeypatch, tmp_path):
     """ApiError 是「已翻译成人话的失败」，穿到 worker 那层会变成一段红色的栈。"""
     FakeApi(lambda path, body, nth: http_error(500, b'down')).install(monkeypatch)
-    preview = tool.preview({'staff': 's1', 'out_dir': str(tmp_path)}, RunContext())
+    preview = tool.preview(args('s1', tmp_path), RunContext())
     assert not preview.ok
     assert preview.summary.startswith('vndb 接口出错：')
     assert 'HTTP 500' in preview.summary
 
-    result = tool.run({'staff': 's1', 'out_dir': str(tmp_path)}, RunContext())
+    result = tool.run(args('s1', tmp_path), RunContext())
     assert result.output_paths == []
     assert 'vndb 接口出错' in result.summary
     assert [n for n, _ in result.failures] == ['vndb 接口']
@@ -1353,8 +1456,7 @@ def test_result_table_falls_back_to_the_first_non_empty_combo(monkeypatch,
     monkeypatch.setattr(fetch, 'ensure_credits',
                         lambda ss, ctx, client=None: (items, []))
 
-    result = tool.run({'staff': 's1, s2, s3', 'out_dir': str(tmp_path)},
-                      RunContext())
+    result = tool.run(args('s1, s2, s3', tmp_path), RunContext())
     assert '共同出演 : 2 个组合有交集（共 4 个组合）' in result.summary
     assert result.table.title == 'N1 S1、N2 S2 共同出演 1 部'
     assert result.table.columns == ('发售日', 'Title', '日文原名',
@@ -1386,3 +1488,37 @@ def test_cli_exit_code_says_whether_anything_was_written(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, 'run', lambda params, ctx: RunResult(
         summary='好了', output_paths=[str(tmp_path / 'x.xlsx')]))
     assert cli.main() == 0
+
+
+def test_cli_defaults_to_exporting_and_only_saves_when_told(monkeypatch,
+                                                            tmp_path):
+    """不带 --db 的调用与旧脚本一模一样：只导出，不碰库。GUI 的默认值正相反。"""
+    seen = []
+
+    def spy(params, ctx):
+        seen.append(params)
+        return RunResult(summary='', output_paths=['x'])
+
+    monkeypatch.setattr(cli, 'run', spy)
+    monkeypatch.setattr(cli.sys, 'argv', ['cli', 's1', '-o', str(tmp_path)])
+    assert cli.main() == 0
+    monkeypatch.setattr(cli.sys, 'argv',
+                        ['cli', 's1', '--db', str(tmp_path), '--no-export'])
+    assert cli.main() == 0
+    assert [(p['save_db'], p['export'], p['db_dir']) for p in seen] == [
+        (False, True, ''), (True, False, str(tmp_path))]
+
+
+def test_cli_refuses_the_combinations_that_would_write_nothing(monkeypatch,
+                                                               tmp_path):
+    """规则与 GUI 共用 validate 那一份：两个都关等于白抓，库目录必须已存在。"""
+    def boom(params, ctx):
+        raise AssertionError('不该抓')
+
+    monkeypatch.setattr(cli, 'run', boom)
+    for argv in (['cli', 's1', '--no-export'],
+                 ['cli', 's1', '--no-export', '--db', str(tmp_path / '还没有')]):
+        monkeypatch.setattr(cli.sys, 'argv', argv)
+        with pytest.raises(SystemExit) as caught:
+            cli.main()
+        assert caught.value.code == 2
