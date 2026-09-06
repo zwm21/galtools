@@ -270,6 +270,7 @@ class MainWindow(QMainWindow):
         self.runner = JobRunner(self.bridge)
         self.pages = {}
         self._preview_page = None
+        self._preview_params = {}
         self._active_page = None
         self._outputs = []
         self._run_started = 0.0
@@ -416,12 +417,16 @@ class MainWindow(QMainWindow):
         if page.validation_errors():
             return
         self._preview_page = page
-        self.runner.request_preview(page.spec, page.form.values(), page.session)
+        self._preview_params = page.form.values()
+        self.runner.request_preview(page.spec, self._preview_params, page.session)
 
     def _on_preview_ready(self, gen, result):
         if not self.runner.is_current_preview(gen) or self._preview_page is None:
             return
         self._preview_page.show_preview(result)
+        # 预览跑通就说明这些目录是能读的，记下来。只看不导的用法从不点「开始」，
+        # 光靠 _start_run 里的 remember_paths 的话，路径每次开界面都得重新粘。
+        self._preview_page.form.remember_dirs(self._preview_params)
         self._idle()
 
     def _on_preview_failed(self, gen, msg):

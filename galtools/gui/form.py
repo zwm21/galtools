@@ -258,6 +258,16 @@ class ToolForm(QWidget):
             editor.addItems(items)
             editor.setCurrentText(items[0])
 
+    def _push_history(self, field_key, value):
+        """把一个值挪到历史最前，返回新的历史列表。只写设置，不动控件。"""
+        items = self._settings.value(self._history_key(field_key)) or []
+        if isinstance(items, str):
+            items = [items]
+        items = [value] + [i for i in items if i != value]
+        del items[HISTORY_LIMIT:]
+        self._settings.setValue(self._history_key(field_key), items)
+        return items
+
     def remember_paths(self):
         """把本次实际用过的值记进历史，供下次直接下拉选。"""
         for f in self.spec.fields:
@@ -266,15 +276,26 @@ class ToolForm(QWidget):
             value = self._getters[f.key]()
             if not value:
                 continue
-            items = self._settings.value(self._history_key(f.key)) or []
-            if isinstance(items, str):
-                items = [items]
-            items = [value] + [i for i in items if i != value]
-            del items[HISTORY_LIMIT:]
-            self._settings.setValue(self._history_key(f.key), items)
+            items = self._push_history(f.key, value)
             editor = self._editors[f.key]
             editor.blockSignals(True)
             editor.clear()
             editor.addItems(items)
             editor.setCurrentText(value)
             editor.blockSignals(False)
+
+    def remember_dirs(self, values):
+        """预览成功时把其中真实存在的目录记进历史。
+
+        只看不导的用法（翻库、看统计、比对数字）从不点「开始」，remember_paths
+        因此永远不会执行，下次打开又得重新粘一遍路径。
+
+        与 remember_paths 不同，这里绝不碰控件：预览是敲字过程中自动触发的，
+        重排下拉项会打断用户正在输入的那一格。
+        """
+        for f in self.spec.fields:
+            if f.kind != DIR:
+                continue
+            value = values.get(f.key)
+            if value and os.path.isdir(value):
+                self._push_history(f.key, value)

@@ -23,7 +23,9 @@ from PySide6.QtCore import QSettings, Qt                       # noqa: E402
 from PySide6.QtWidgets import QApplication                     # noqa: E402
 
 from galtools.core.context import Cancelled                    # noqa: E402
-from galtools.core.spec import TEXT, Field, RunResult, ToolSpec  # noqa: E402
+from galtools.core.spec import (                                # noqa: E402
+    TEXT, Field, PreviewResult, RunResult, ToolSpec,
+)
 from galtools.gui import main_window as mw                     # noqa: E402
 from galtools.gui.form import normalize_path                   # noqa: E402
 from galtools.gui.worker import Bridge, JobRunner              # noqa: E402
@@ -138,6 +140,73 @@ def test_starting_a_run_takes_over_the_progress_bar(qt_app, monkeypatch,
         win._on_run_cancelled(None)
         assert win.progress.maximum() == 100
         assert win.status.text() == '已取消'
+    finally:
+        win.close()
+
+
+def test_a_successful_preview_remembers_the_directory(qt_app, monkeypatch,
+                                                      tmp_path):
+    """只看不导的用法（翻库、看统计）从不点「开始」，_start_run 里的
+    remember_paths 因此永远不跑，路径每次开界面都得重新粘一遍。"""
+    db = tmp_path / 'db'
+    db.mkdir()
+    win = window(monkeypatch, tmp_path)
+    try:
+        page = win.pages['seiyuu_db']
+        page.form._editors['db_dir'].setCurrentText(str(db))
+        page.form._editors['who'].setCurrentText('s1')
+        assert page.validation_errors() == {}     # 证明预览不会被校验拦下
+        monkeypatch.setattr(win.runner, 'request_preview',
+                            lambda *a, **k: None)  # 不真起线程
+        win._request_preview(page)
+        win._on_preview_ready(win.runner._preview_gen,
+                              PreviewResult(summary='只看不导', ok=False))
+    finally:
+        win.close()
+
+    again = window(monkeypatch, tmp_path)
+    try:
+        values = again.pages['seiyuu_db'].form.values()
+        assert values['db_dir'] == str(db)
+        # 只记目录。声优名这类 TEXT 历史仍只在真跑过一轮之后才记。
+        assert values['who'] == ''
+    finally:
+        again.close()
+
+
+def test_remembering_a_directory_does_not_disturb_typing(qt_app, monkeypatch,
+                                                         tmp_path):
+    """预览是敲字过程中自动触发的。remember_paths 那套「清空下拉项再重填」会把
+    光标从用户正在输入的那一格里踢出去，所以这条路径只许写设置。"""
+    win = window(monkeypatch, tmp_path)
+    try:
+        form = win.pages['seiyuu_db'].form
+        editor = form._editors['db_dir']
+        half_typed = str(tmp_path) + os.sep + '还没打完'
+        editor.setCurrentText(half_typed)
+        changes = []
+        editor.currentTextChanged.connect(changes.append)
+
+        form.remember_dirs({'db_dir': str(tmp_path)})
+
+        assert changes == []
+        assert editor.currentText() == half_typed
+        assert editor.count() == 0
+        assert form._settings.value(form._history_key('db_dir')) == [str(tmp_path)]
+    finally:
+        win.close()
+
+
+def test_a_directory_that_does_not_exist_is_not_remembered(qt_app, monkeypatch,
+                                                           tmp_path):
+    """历史是给下拉框用的。记一条打不开的路径，下次开界面它就排在最前面。"""
+    win = window(monkeypatch, tmp_path)
+    try:
+        form = win.pages['seiyuu_db'].form
+        form.remember_dirs({'db_dir': str(tmp_path / '没有这个目录'),
+                            'out_dir': ''})
+        assert form._settings.value(form._history_key('db_dir')) is None
+        assert form._settings.value(form._history_key('out_dir')) is None
     finally:
         win.close()
 
