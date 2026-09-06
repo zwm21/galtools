@@ -1003,6 +1003,46 @@ def test_clean_strips_control_chars():
     assert xlsx.clean(5) == 5
 
 
+def test_clean_caps_strings_at_the_excel_cell_limit():
+    """超长的 note 直接落格会让 Excel 打开时报「已修复的记录」，写之前截掉。"""
+    long_note = 'あ' * 32800
+    got = xlsx.clean(long_note)
+    assert len(got) == xlsx.CELL_TEXT_MAX
+    assert got == long_note[:xlsx.CELL_TEXT_MAX]
+    assert xlsx.clean('x' * xlsx.CELL_TEXT_MAX) == 'x' * xlsx.CELL_TEXT_MAX
+
+
+def test_build_honours_cancellation_between_sheets(tmp_path):
+    """写盘是抓取之外唯一的取消盲区：取消发生在 wb.save 之前，不留半成品文件。"""
+    pytest.importorskip('openpyxl')
+    a = person('s1', [credit('v1', 'A1', 'c1')])
+    b = person('s2', [credit('v1', 'B1', 'c2')])
+
+    class CancelAtThird:
+        def __init__(self):
+            self.calls = 0
+
+        def check_cancel(self):
+            self.calls += 1
+            if self.calls >= 3:
+                raise Cancelled()
+
+    target = str(tmp_path / 'out.xlsx')
+    with pytest.raises(Cancelled):
+        xlsx.build([a, b], fetch.combos([a, b]), target, ctx=CancelAtThird())
+    assert not os.path.exists(target)
+
+
+def test_build_without_ctx_writes_everything(tmp_path):
+    """不传 ctx 的旧调用方式（名册导出之外的直接调用）行为不变。"""
+    pytest.importorskip('openpyxl')
+    from openpyxl import load_workbook
+
+    a = person('s1', [credit('v1', 'A1', 'c1')])
+    path = xlsx.build([a], [], str(tmp_path / 'one.xlsx'))
+    assert load_workbook(path).sheetnames == ['概览', 'S1 s1']
+
+
 # ---------------- 工具层 ----------------
 def test_validate_is_offline_and_reports_first_bad_target(tmp_path):
     assert tool.validate(args('s1', tmp_path)) == []
@@ -1301,6 +1341,18 @@ def test_a_persons_db_write_failure_only_blames_himself(monkeypatch, tmp_path):
     assert [n for n, _ in result.failures] == ['ベータ (Beta Two) s2']
     assert result.warnings == ['1 个人没写进本地库。']
     assert '本地库 : 1/2 人' in result.summary
+
+
+def test_a_hand_edited_sid_falls_back_to_empty_on_read(tmp_path):
+    """库文件是用户能手改的：sid 不像 id 时退回空串，其余字段照读，不拒读整份。"""
+    payload = {'schema': store.SCHEMA, 'sid': '../s1', 'name': 'X',
+               'original': 'エックス',
+               'credits': [{'vid': 'v1', 'title': 'Alpha'}]}
+    (tmp_path / 's1.json').write_text(json.dumps(payload), encoding='utf-8')
+    person = store.read_person(str(tmp_path), 's1')
+    assert person.staff.sid == ''
+    assert person.staff.name == 'X'
+    assert [c.vid for c in person.credits] == ['v1']
 
 
 def test_tool_spec_fields_match_what_run_reads():
