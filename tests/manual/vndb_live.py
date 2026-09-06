@@ -59,3 +59,26 @@ result = tool.run(params, ConsoleContext())
 print('--- update_all ---')
 print(result.summary)
 print('update_all 耗时 %.1fs' % (time.time() - t1))
+
+# --- 确定性对账：已知会翻转的人连抓两遍，结果必须一致 ---
+# s260 的 c3050 在 v80 里同时挂 primary/side 两条 role、数组顺序在请求间不稳
+# （2026-09 实测），修复前两遍抓取可能各翻一个值，update 因此反复误报
+# 「有变化」。same_item 验字段级一致，strict 再验逐条顺序一致（排序规范化）。
+from galtools.tools.vndb_voiced import update
+from galtools.tools.vndb_voiced.model import StaffCredits
+
+t2 = time.time()
+staff260 = fetch.load_staff('s260', client)
+first = fetch.fetch_credits(staff260, client)
+second = fetch.fetch_credits(staff260, client)
+shape = lambda credits: [tuple(getattr(c, f) for f in store.CREDIT_FIELDS)
+                         for c in credits]
+same = update.same_item(StaffCredits(staff=staff260, credits=first),
+                        StaffCredits(staff=staff260, credits=second))
+strict = shape(first) == shape(second)
+print('--- determinism: s260 fetched twice ---')
+print('rows=%d/%d same_item=%s strict_order=%s'
+      % (len(first), len(second), same, strict))
+print('determinism 耗时 %.1fs' % (time.time() - t2))
+if not (same and strict):
+    sys.exit('s260 两遍抓取不一致：role 冲突或排序规范化失效')

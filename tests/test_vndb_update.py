@@ -282,3 +282,73 @@ def test_cli_update_all_runs_the_update_pipeline(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as caught:
         cli.main()
     assert caught.value.code == 2
+
+
+# ---------------- 抓取确定性的集成回归（2026-09 误报「有变化」事件） ----------------
+def _conflicting_s3(monkeypatch, roles_in_order):
+    """让 s3 唯一的角色在 v9 里挂多条 role，数组顺序由调用方指定。
+
+    vndb 按 release 分别挂角色，且数组顺序在请求间不稳定：修复前全库更新
+    会对这类人反复误报「有变化 +0/-0」。
+    """
+    monkeypatch.setitem(online.CHAR_ROWS, 's3', [
+        {'id': 'c5', 'name': 'Chara Five', 'original': '',
+         'vns': [{'id': 'v9', 'role': role} for role in roles_in_order]}])
+    monkeypatch.setitem(online.VN_ROWS, 'v9', {
+        'id': 'v9', 'title': 'Game Nine', 'alttitle': '', 'released': '2001-05-05',
+        'va': [{'staff': {'id': 's3', 'aid': 'a7'},
+                'character': {'id': 'c5'}, 'note': ''}]})
+
+
+def test_update_ignores_vndb_role_row_order(monkeypatch, tmp_path):
+    # 建库与更新拿到相反的 role 数组顺序，结果必须是「无变化」且不重写
+    _conflicting_s3(monkeypatch, ('side', 'primary'))
+    before = seed_library(monkeypatch, tmp_path, 's3')
+    _conflicting_s3(monkeypatch, ('primary', 'side'))
+    result = tool.run(update_params(tmp_path), RunContext())
+    assert result.failures == []
+    assert '更新 0 人' in result.summary
+    assert (tmp_path / 's3.json').read_bytes() == before['s3']
+    # 落库的 role 是规范值：ROLES 序里最重要的一个
+    person = store.read_person(str(tmp_path), 's3')
+    assert [c.role for c in person.credits] == ['primary']
+
+
+TIE_STAFF = [{'id': 's3', 'aid': 'a7', 'ismain': True,
+              'name': 'Gamma Three', 'original': 'ガンマ'},
+             {'id': 's3', 'aid': 'a8', 'ismain': False,
+              'name': 'Echo Three', 'original': ''}]
+
+
+def _tied_s3(monkeypatch, va_order):
+    """两个同名角色 × 两个别名全挤在 v9 里：(发售日, 标题, 角色名) 三级排序键
+    全部打平，写出顺序只能由 cid/alias 决定；va 数组顺序由调用方指定。"""
+    monkeypatch.setitem(online.STAFF_ROWS, 's3', TIE_STAFF)
+    monkeypatch.setitem(online.CHAR_ROWS, 's3', [
+        {'id': 'c5', 'name': 'Same Name', 'original': '',
+         'vns': [{'id': 'v9', 'role': 'main'}]},
+        {'id': 'c6', 'name': 'Same Name', 'original': '',
+         'vns': [{'id': 'v9', 'role': 'side'}]}])
+    vas = [{'staff': {'id': 's3', 'aid': aid}, 'character': {'id': cid},
+            'note': ''} for cid, aid in va_order]
+    monkeypatch.setitem(online.VN_ROWS, 'v9', {
+        'id': 'v9', 'title': 'Game Nine', 'alttitle': '',
+        'released': '2001-05-05', 'va': vas})
+
+
+def test_update_writes_tied_credits_in_canonical_order(monkeypatch, tmp_path):
+    pairs = [('c5', 'a7'), ('c5', 'a8'), ('c6', 'a7'), ('c6', 'a8')]
+    dir_a = tmp_path / 'a'
+    dir_a.mkdir()
+    _tied_s3(monkeypatch, list(reversed(pairs)))
+    seed_library(monkeypatch, dir_a, 's3')
+    person = store.read_person(str(dir_a), 's3')
+    assert [(c.cid, c.alias) for c in person.credits] == [
+        ('c5', 'Echo Three'), ('c5', 'Gamma Three'),
+        ('c6', 'Echo Three'), ('c6', 'Gamma Three')]
+    # va 数组换个顺序再建一份库，两份字节完全一致
+    dir_b = tmp_path / 'b'
+    dir_b.mkdir()
+    _tied_s3(monkeypatch, pairs)
+    seed_library(monkeypatch, dir_b, 's3')
+    assert (dir_a / 's3.json').read_bytes() == (dir_b / 's3.json').read_bytes()

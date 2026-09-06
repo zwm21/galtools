@@ -514,6 +514,43 @@ def test_fetch_credits_drops_other_seiyuu_and_overmatched_vns(monkeypatch):
     assert (two.alias, two.role, two.note) == ('A. One', 'side', '2024 remake')
 
 
+def _conflicting_s3(monkeypatch, roles_in_order):
+    """让 s3 唯一的角色在 v9 里挂多条 role，数组顺序由调用方指定。
+
+    vndb 按 release 分别挂角色，同一 (vid, cid) 会在 vns 数组里出现多次、
+    role 各不相同，且数组顺序在请求间不稳定（2026-09 全库更新实测 7 人因此
+    误报「有变化」）。
+    """
+    monkeypatch.setitem(CHAR_ROWS, 's3', [
+        {'id': 'c5', 'name': 'Chara Five', 'original': '',
+         'vns': [{'id': 'v9', 'role': role} for role in roles_in_order]}])
+    monkeypatch.setitem(VN_ROWS, 'v9', {
+        'id': 'v9', 'title': 'Game Nine', 'alttitle': '', 'released': '2001-05-05',
+        'va': [{'staff': {'id': 's3', 'aid': 'a7'},
+                'character': {'id': 'c5'}, 'note': ''}]})
+    FakeApi(vndb()).install(monkeypatch)
+    return fetch.load_staff('s3', api.Client())
+
+
+def test_conflicting_roles_take_the_most_important_one(monkeypatch):
+    # 同一 (vid, cid) 多条 role 时取 ROLES 序里最重要者，与数组顺序无关
+    for order in (('side', 'primary'), ('primary', 'side')):
+        staff = _conflicting_s3(monkeypatch, order)
+        credits = fetch.fetch_credits(staff, api.Client())
+        assert [c.role for c in credits] == ['primary']
+
+
+def test_conflicting_roles_known_beats_unknown_then_name_order(monkeypatch):
+    for order in (('zzz', 'side'), ('side', 'zzz')):
+        staff = _conflicting_s3(monkeypatch, order)
+        credits = fetch.fetch_credits(staff, api.Client())
+        assert [c.role for c in credits] == ['side']
+    for order in (('zzz', 'aaa'), ('aaa', 'zzz')):
+        staff = _conflicting_s3(monkeypatch, order)
+        credits = fetch.fetch_credits(staff, api.Client())
+        assert [c.role for c in credits] == ['aaa']
+
+
 def test_ensure_resolved_caches_until_cleared(monkeypatch):
     fake = FakeApi(vndb()).install(monkeypatch)
     ctx = RunContext()

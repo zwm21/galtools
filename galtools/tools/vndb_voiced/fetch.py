@@ -21,7 +21,7 @@ import re
 
 from . import api
 from .model import (
-    Candidate, Combo, Common, Credit, Resolution, Staff, StaffCredits,
+    ROLES, Candidate, Combo, Common, Credit, Resolution, Staff, StaffCredits,
     released_sort_key, url_for,
 )
 
@@ -106,6 +106,17 @@ def classify(target):
     if len(text) < 2:
         return 'bad', '「%s」太短，一个字符会命中成百上千人' % text
     return 'name', text
+
+
+# /character 的 vns 数组里同一部作品可能出现多次、role 各不相同（VNDB 按
+# release 分别挂角色），且数组顺序在请求间不稳定。role 只从这里取，所以必须
+# 在客户端消歧：取 ROLES 序里最重要者，与「该角色在这部作品里的最高番位」
+# 语义一致；未知 role 排最后、按名字序兜底——任何响应顺序都选出同一个值。
+ROLE_RANK = {role: index for index, role in enumerate(ROLES)}
+
+
+def _role_key(role):
+    return (ROLE_RANK.get(role, len(ROLES)), role)
 
 
 # ---------------- 过滤器 ----------------
@@ -227,7 +238,11 @@ def fetch_credits(staff, client, on_progress=None):
                                          'fields': CHAR_FIELDS, 'sort': 'id'}):
         chars[ch.get('id')] = (ch.get('name') or '', ch.get('original') or '')
         for vn in ch.get('vns') or []:
-            roles[(vn.get('id'), ch.get('id'))] = vn.get('role') or ''
+            key = (vn.get('id'), ch.get('id'))
+            role = vn.get('role') or ''
+            old = roles.get(key)
+            if old is None or _role_key(role) < _role_key(old):
+                roles[key] = role
 
     state = {'total': 0, 'done': 0}
     credits = []
@@ -252,7 +267,10 @@ def fetch_credits(staff, client, on_progress=None):
                 released=vn.get('released') or '', cid=cid,
                 cast=cast, cast_ja=cast_ja, alias=alias, alias_ja=alias_ja,
                 note=va.get('note') or '', role=roles.get((vid, cid), '')))
-    credits.sort(key=lambda c: (released_sort_key(c.released), c.title, c.cast))
+    # 并列排序键补到 cid/alias：前三键打平时先后由 va 数组顺序决定，而它在
+    # 请求间不稳定，写出的 json 字节序会跟着波动。
+    credits.sort(key=lambda c: (released_sort_key(c.released), c.title, c.cast,
+                                c.cid, c.alias))
     return credits
 
 
