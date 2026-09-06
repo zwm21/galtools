@@ -1357,14 +1357,17 @@ def test_a_hand_edited_sid_falls_back_to_empty_on_read(tmp_path):
 
 def test_tool_spec_fields_match_what_run_reads():
     keys = {f.key for f in tool.TOOL.fields}
-    assert keys == {'staff', 'save_db', 'db_dir', 'export', 'out_dir', 'refresh'}
-    assert [f.key for f in tool.TOOL.fields if f.rescan] == ['staff', 'refresh']
+    assert keys == {'staff', 'save_db', 'db_dir', 'export', 'out_dir', 'refresh',
+                    'update_all'}
+    # 更新全库是贵操作：勾选只标记过期，等用户点「查询」，不能勾一下就自动开打。
+    assert [f.key for f in tool.TOOL.fields if f.rescan] == ['staff', 'refresh',
+                                                             'update_all']
     # 两个目录都是条件必填，写成 required=True 会让 ToolPage 在 validate 之前
     # 就报「必填」，连预览都发不出去。
     assert [f.key for f in tool.TOOL.fields if f.required] == ['staff']
     assert dict((f.key, f.default) for f in tool.TOOL.fields
                 if f.kind == 'bool') == {'save_db': True, 'export': False,
-                                         'refresh': False}
+                                         'refresh': False, 'update_all': False}
 
 
 # ---------------- 结果表格 ----------------

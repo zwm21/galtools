@@ -6,13 +6,16 @@ from ...core.context import Cancelled
 from ...core.spec import (
     BOOL, DIR, TEXT, Field, PreviewResult, RunResult, Table, ToolSpec,
 )
-from . import api, fetch, store, tables, xlsx
+from . import api, fetch, store, tables, update, xlsx
 from .model import url_for
 
 # 预计耗时用的经验系数：实测 288 部候选作品 11.8 秒（其中 /vn 翻页占 8.3 秒）。
 SECONDS_PER_VN = 0.045
 SECONDS_PER_STAFF = 2.0
 REFRESH_FLAG = 'refresh_done'
+# 更新全库的 staff 列表缓存键，与 fetch.CACHE_KEYS 并列挂在 ctx.session 上：
+# preview 确认过谁还在 vndb 上，run 不该把几十次 /staff 请求再打一遍。
+UPDATE_STAFFS_KEY = 'update_staffs'
 
 # 人数上限：N 人的两两及以上组合有 2^N-N-1 个，每个非空组合一张工作表。8 人最多
 # 247 张，已经是 Excel 里翻不动的量；再往上只会产出没人看的文件。
@@ -32,6 +35,7 @@ def _apply_refresh(params, ctx):
         return
     if not ctx.session.get(REFRESH_FLAG):
         fetch.clear_cache(ctx)
+        ctx.session.pop(UPDATE_STAFFS_KEY, None)
         ctx.session[REFRESH_FLAG] = True
 
 
@@ -93,6 +97,19 @@ def too_many_people(count):
             % (MAX_TARGETS, count, 2 ** count - count - 1))
 
 
+def _validate_update(params):
+    """更新全库只看库目录：staff 被忽略，Excel 不导出。"""
+    errors = []
+    db_dir = params.get('db_dir')
+    if db_dir and not os.path.isdir(db_dir):
+        errors.append(('db_dir', '目录不存在或不可访问'))
+    elif not db_dir:
+        errors.append(('db_dir', '更新全库要填库目录'))
+    if params.get('export'):
+        errors.append(('export', '更新全库时不导出 Excel，请关掉'))
+    return errors
+
+
 def validate(params):
     """每敲一个键都会跑，只做纯本地判断，绝不联网。
 
@@ -100,6 +117,8 @@ def validate(params):
     required=True 的话 ToolPage.validation_errors 会在跑到这里之前就报「必填」，
     连预览都发不出去——而开关关掉的那一个本来就不用填。
     """
+    if params.get('update_all'):
+        return _validate_update(params)
     errors = []
     save_db, export = bool(params.get('save_db')), bool(params.get('export'))
     if not save_db and not export:
@@ -129,8 +148,148 @@ def validate(params):
     return errors
 
 
+# ---------------- 更新全库 ----------------
+def _update_batch(params, ctx):
+    """读库 → 逐人抓最新 → 与本地比对，返回 (entries, broken, fatal)。
+
+    preview 与 run 共用这一条管线：抓取走 ensure_credits 的会话缓存，run 命中
+    缓存时零请求。fatal 非空表示库目录本身读不了，entries 为 None。
+    """
+    try:
+        people, broken = store.read_all(params.get('db_dir'))
+    except store.BadFile as e:
+        return None, [], str(e)
+    if not people:
+        return [], broken, ''
+
+    client = api.Client(ctx)
+    key = tuple(update.person_key(person) for person in people)
+    cached = ctx.session.get(UPDATE_STAFFS_KEY)
+    if cached is not None and cached[0] == key:
+        staffs, errors = cached[1], {}
+    else:
+        staffs, errors = [], {}
+        total = len(people)
+        for i, person in enumerate(people):
+            # list_files 只认 s<id>.json，person_key 在这里总能拿到合法 sid：
+            # 文件内容里的 sid 坏了也能从文件名救回来，写完顺手把它治愈。
+            sid = key[i]
+            ctx.progress(i, total, '正在确认 %s 的 vndb 主页…' % sid)
+            try:
+                staff = fetch.load_staff(sid, client)
+            except api.ApiError as e:
+                errors[sid] = str(e)
+                continue
+            if staff is None:
+                errors[sid] = 'vndb 上已经没有 %s 这个人' % sid
+                continue
+            staffs.append(staff)
+        if not errors:
+            # 与 ensure_credits 同一口径：抖一次网造成的残缺名单不缓存，
+            # 否则用户再点一次「查询」拿回的仍是同一份残缺。
+            ctx.session[UPDATE_STAFFS_KEY] = (key, staffs)
+    items, hard = fetch.ensure_credits(staffs, ctx, client)
+    by_label = {staff.label(): staff.sid for staff in staffs}
+    for lbl, reason in hard:
+        errors[by_label.get(lbl, lbl)] = reason
+    fresh = {item.staff.sid: item for item in items}
+    return update.build_entries(people, fresh, errors), broken, ''
+
+
+def _preview_update(params, ctx):
+    ctx.progress(0, 0, '正在读本地库…')
+    try:
+        entries, broken, fatal = _update_batch(params, ctx)
+    except api.ApiError as e:
+        # ApiError 已经是人话，不能让它穿到 worker 那层变成一段栈。
+        return PreviewResult(summary='vndb 接口出错：%s' % e, ok=False)
+    if fatal:
+        return PreviewResult(summary='本地库读不出来：%s' % fatal, ok=False)
+    if not entries:
+        return PreviewResult(
+            summary='库里还没有人：先在上面的「声优」里填人抓进库，再来更新。',
+            ok=False)
+    lines = ['库内 %d 人，%s。' % (len(entries), update.summary_line(entries))]
+    for entry in entries:
+        if entry.status != update.CHANGED:
+            continue
+        titles = []
+        for credit in entry.added:
+            if credit.title not in titles:
+                titles.append(credit.title)
+        note = ''
+        if titles:
+            note = '，新增：%s' % '、'.join(titles[:5])
+            if len(titles) > 5:
+                note += ' 等'
+        lines.append('%s：%d → %d（+%d/-%d）%s' % (
+            entry.person.staff.label(), len(entry.person.credits),
+            len(entry.fresh.credits), len(entry.added), len(entry.removed),
+            note))
+    warnings = []
+    if broken:
+        warnings.append('%d 个库文件读不出来，已跳过：%s'
+                        % (len(broken),
+                           '、'.join(name for name, _ in broken[:3])))
+    failed = update.counts(entries)[3]
+    if failed:
+        warnings.append('%d 个人抓取失败，点「开始」也不会更新他们。' % failed)
+    return PreviewResult(summary='\n'.join(lines), warnings=warnings,
+                         table=update.update_table(entries))
+
+
+def _run_update(params, ctx):
+    """命令行从不预览，所以 run 自己也要走完整管线（有缓存时零请求）。"""
+    _apply_refresh(params, ctx)
+    try:
+        entries, broken, fatal = _update_batch(params, ctx)
+    except api.ApiError as e:
+        return RunResult(summary='\nvndb 接口出错，没有写出文件。',
+                         failures=[('vndb 接口', str(e))])
+    if fatal:
+        return RunResult(summary='\n本地库读不出来，没有写出文件。',
+                         failures=[('库目录', fatal)])
+    if not entries:
+        return RunResult(summary='\n库里还没有人，什么都没做。',
+                         failures=[('库目录', '库里还没有人')])
+
+    db_dir = params.get('db_dir')
+    lines = ['\n========== 更新结果 ==========']
+    failures, written = [], []
+    for entry in entries:
+        label = entry.person.staff.label() or update.person_key(entry.person)
+        if entry.status == update.FAILED:
+            failures.append((label, entry.error))
+        elif entry.status == update.EMPTY:
+            failures.append((label, 'vndb 上抓到 0 条，保留旧文件'))
+        elif entry.status == update.CHANGED:
+            try:
+                store.write_person(db_dir, entry.fresh)
+            except (store.BadFile, OSError) as e:
+                ctx.log('%s 没写进本地库：%s' % (label, e), 'warn')
+                failures.append((label, str(e)))
+            else:
+                written.append(entry)
+                lines.append('%s : %d → %d（+%d/-%d）' % (
+                    label, len(entry.person.credits), len(entry.fresh.credits),
+                    len(entry.added), len(entry.removed)))
+    lines.append('更新 %d 人 / %s' % (len(written), update.summary_line(entries)))
+    warnings = []
+    if broken:
+        warnings.append('%d 个库文件读不出来，已跳过。' % len(broken))
+    lines += ['=' * 30, '全部完成。']
+    # 全都没写且有失败项时不给输出路径：命令行据此退出非零，脚本才能感知
+    # 「这一趟白跑了」。全部无变化（已是最新）算成功，路径照给。
+    outputs = [db_dir] if written or not failures else []
+    return RunResult(summary='\n'.join(lines), output_paths=outputs,
+                     warnings=warnings, failures=failures,
+                     table=update.update_table(entries))
+
+
 def preview(params, ctx):
     _apply_refresh(params, ctx)
+    if params.get('update_all'):
+        return _preview_update(params, ctx)
     targets = fetch.parse_targets(params.get('staff'))
     if not targets:
         return PreviewResult(
@@ -188,8 +347,10 @@ def run(params, ctx):
     """先把导出目录备好再抓，一无所获时把自己建的那个目录收回去。
 
     不导出时整段跳过：只存库的那一次没有 xlsx 要落地，而库目录 validate 已经
-    要求它本来就存在。
+    要求它本来就存在。更新全库模式没有 xlsx 这回事，走自己的管线。
     """
+    if params.get('update_all'):
+        return _run_update(params, ctx)
     if not params.get('export'):
         return _run(params, ctx)
     out_dir = params.get('out_dir')
@@ -218,20 +379,38 @@ def run(params, ctx):
 
 
 def _save_to_db(db_dir, ctx, items):
-    """把抓到的人写进本地库，返回 (写成功的 sid, 失败项)。
+    """把抓到的人写进本地库，返回 (写成功的 sid, 无变化跳过的 sid, 失败项)。
 
-    一个人写失败只报他自己：库是一人一个文件，没有「写了一半」的中间状态。
+    写之前先跟旧文件比一遍：一字不差就不重写（连 fetched_at 也不动，文件时间
+    才能如实反映数据新旧）；旧文件非空而新数据 0 条时保留旧文件——那多半是
+    vndb 抽风，不该把攒了好几年的人员档案抹成空白。一个人写失败只报他自己：
+    库是一人一个文件，没有「写了一半」的中间状态。
     """
-    saved, failures = [], []
+    saved, skipped, failures = [], [], []
     for item in items:
+        who = item.staff.label()
+        if os.path.exists(store.path_for(db_dir, item.staff.sid)):
+            try:
+                old = store.read_person(db_dir, item.staff.sid)
+            except store.BadFile as e:
+                ctx.log('%s 的旧文件读不出来，没有覆盖：%s' % (who, e), 'warn')
+                failures.append((who, str(e)))
+                continue
+            if not item.credits and old.credits:
+                ctx.log('%s 在 vndb 上抓到 0 条，保留旧文件' % who, 'warn')
+                failures.append((who, 'vndb 上抓到 0 条，保留旧文件'))
+                continue
+            if update.same_item(old.item, item):
+                skipped.append(item.staff.sid)
+                continue
         try:
             store.write_person(db_dir, item)
         except (store.BadFile, OSError) as e:
             ctx.log('%s 没写进本地库：%s' % (item.staff.label(), e), 'warn')
-            failures.append((item.staff.label(), str(e)))
+            failures.append((who, str(e)))
         else:
             saved.append(item.staff.sid)
-    return saved, failures
+    return saved, skipped, failures
 
 
 def _run(params, ctx):
@@ -299,13 +478,16 @@ def _run(params, ctx):
     if params.get('save_db'):
         db_dir = params.get('db_dir')
         ctx.log('正在写本地库…')
-        saved, refused = _save_to_db(db_dir, ctx, items)
+        saved, skipped, refused = _save_to_db(db_dir, ctx, items)
         failures += refused
         if refused:
             warnings.append('%d 个人没写进本地库。' % len(refused))
-        if saved:
+        if saved or skipped:
             outputs.append(db_dir)
-        lines.append('本地库 : %d/%d 人 -> %s' % (len(saved), len(items), db_dir))
+        line = '本地库 : %d/%d 人 -> %s' % (len(saved), len(items), db_dir)
+        if skipped:
+            line += '（%d 人无变化，未重写）' % len(skipped)
+        lines.append(line)
     if params.get('export'):
         ctx.log('正在写 Excel…')
         try:
@@ -334,7 +516,8 @@ TOOL = ToolSpec(
     description='抓 VNDB 上某个声优配过的全部角色，默认存进本地库（一人一个 json，'
                 '「声优库」工具读的就是它），也可以直接导出 Excel：一页概览 + 每人'
                 '一页明细。填两人以上时额外算出共同出演的作品，三人以上按两两'
-                '及以上的组合各出一页。',
+                '及以上的组合各出一页。勾上「更新全库」则把库目录里已有的每个人'
+                '都重抓一遍，有变化才覆盖。',
     fields=(
         Field(key='staff', kind=TEXT, label='声优', rescan=True, history=True,
               help='id（s367）、声优页网址或名字，多个用逗号分隔，最多 8 个人。'
@@ -356,6 +539,11 @@ TOOL = ToolSpec(
         Field(key='refresh', kind=BOOL, label='重新抓取', default=False,
               rescan=True, required=False,
               help='忽略本次会话已抓到的结果，重新打一遍 vndb 的 API。'),
+        Field(key='update_all', kind=BOOL, label='更新全库', default=False,
+              rescan=True, required=False,
+              help='把库目录里已有的每个人都在 vndb 上重抓一遍：有变化才整份'
+                   '覆盖，没变化不动文件。勾选后忽略上面的「声优」输入，也不'
+                   '导出 Excel；不受 8 人上限约束，人多时要几分钟，耐心等。'),
     ),
     run=run,
     preview=preview,
