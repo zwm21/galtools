@@ -258,3 +258,27 @@ def test_manual_run_never_replaces_a_person_with_zero_credits(monkeypatch,
     assert any('0 条' in reason for _, reason in result.failures)
 
 
+# ---------------- CLI --update-all ----------------
+def test_cli_update_all_requires_db_and_refuses_targets(monkeypatch, tmp_path):
+    for argv in (['cli', '--update-all'],
+                 ['cli', '--update-all', 's1', '--db', str(tmp_path)]):
+        monkeypatch.setattr(cli.sys, 'argv', argv)
+        with pytest.raises(SystemExit) as caught:
+            cli.main()
+        assert caught.value.code == 2
+
+
+def test_cli_update_all_runs_the_update_pipeline(monkeypatch, tmp_path):
+    before = seed_library(monkeypatch, tmp_path, 's1', 's2')
+    online.FakeApi(online.vndb()).install(monkeypatch)
+    monkeypatch.setattr(cli.sys, 'argv',
+                        ['cli', '--update-all', '--db', str(tmp_path)])
+    assert cli.main() == 0                        # 全部已是最新算成功
+    for sid, data in before.items():
+        assert (tmp_path / f'{sid}.json').read_bytes() == data
+    # 库目录必须已存在，这条与 GUI 是同一份 validate
+    monkeypatch.setattr(cli.sys, 'argv',
+                        ['cli', '--update-all', '--db', str(tmp_path / 'nope')])
+    with pytest.raises(SystemExit) as caught:
+        cli.main()
+    assert caught.value.code == 2

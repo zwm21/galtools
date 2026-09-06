@@ -7,7 +7,8 @@
 
 不带 --db 时只导出 xlsx，与旧脚本一模一样；--db 目录 追加存库，再配 --no-export
 就只存库不写表格。GUI 的默认值正相反（默认存库、默认不导出），但两边的规则都由
-ToolSpec.validate 一份说了算。
+ToolSpec.validate 一份说了算。--update-all 是另一条路：不给目标，把 --db 库里
+已有的每个人重抓一遍，与 GUI 的「更新全库」开关同一份逻辑。
 
 setup_console 与 msvcrt 只出现在这条路径上，import 时不执行任何副作用。
 """
@@ -104,9 +105,18 @@ def main():
                     help='只存库，不写 xlsx；要配 --db 用')
     ap.add_argument('--refresh', action='store_true',
                     help='忽略缓存重新抓取（命令行每次都是新进程，一般用不到）')
+    ap.add_argument('--update-all', action='store_true',
+                    help='忽略目标，把 --db 库里已有的每个人都在 vndb 上重抓一遍，'
+                         '有变化才覆盖（要配 --db 用，且不写 xlsx）')
     args = ap.parse_args()
 
-    if args.targets:
+    if args.update_all:
+        if args.targets:
+            ap.error('--update-all 与目标二选一，别一起给')
+        if not args.db:
+            ap.error('--update-all 要配 --db 用')
+        raw = ''
+    elif args.targets:
         raw = ','.join(args.targets)
         targets, error = check_targets(raw)
         if not targets:
@@ -117,9 +127,10 @@ def main():
         print('=' * 46)
         raw = ask_targets()
 
-    params = {'staff': raw, 'out_dir': args.output, 'export': not args.no_export,
+    params = {'staff': raw, 'out_dir': args.output,
+              'export': False if args.update_all else not args.no_export,
               'save_db': bool(args.db), 'db_dir': args.db or '',
-              'refresh': args.refresh}
+              'refresh': args.refresh, 'update_all': args.update_all}
     error = check_options(params)
     if error:
         ap.error(error)

@@ -42,3 +42,20 @@ for c in common[:3]:
 print('--- sample credit ---')
 print(items[0].credits[0])
 print('requests=%d  %.1fs' % (client.requests, time.time() - t0))
+
+# --- update_all：把刚抓的两人写进 tests/manual/live_db，再真更新一遍 ---
+# 期望：第二遍全部「无变化」，一个文件都不重写。库目录留着不删，方便人眼检查。
+from galtools.tools.vndb_voiced import store, tool
+
+db = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'live_db')
+os.makedirs(db, exist_ok=True)
+for it in items:
+    store.write_person(db, it)
+
+params = {'staff': '', 'update_all': True, 'save_db': True, 'db_dir': db,
+          'export': False, 'out_dir': '', 'refresh': False}
+t1 = time.time()
+result = tool.run(params, ConsoleContext())
+print('--- update_all ---')
+print(result.summary)
+print('update_all 耗时 %.1fs' % (time.time() - t1))
