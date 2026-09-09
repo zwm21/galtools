@@ -18,9 +18,7 @@ from galtools.tools.mjo_text import (
 V1 = b'MajiroObjV1.000\x00'
 X1 = b'MajiroObjX1.000\x00'
 
-# is_valid_str 要求字符串结尾的 \0 后面还有字节，主循环 `i + 2 < script_len`
-# 也会漏掉贴在末尾的 opcode。给每份字节码留一点尾部填充，让最后一条指令
-# 落在正常范围内。填充是 0 字节，被当作未知 opcode 逐字节跳过。
+# 多数测试会在字节码尾部补未知 opcode，验证逐字节重同步不会影响正常指令。
 PAD = b'\x00' * 4
 
 
@@ -149,18 +147,23 @@ def test_string_id_and_parse_str_skipped(tmp_path):
                     noise + show_text('あ') + dialog_close()) == ['あ']
 
 
-def test_last_opcode_at_boundary_is_dropped(tmp_path):
-    """既有的差一行为：正好贴在 script_len 末尾的 opcode 不会被处理。
+def test_string_id_operand_is_not_scanned_as_an_opcode(tmp_path):
+    fake_text = struct.pack('<HH', 0x83A, 0x0840) + struct.pack('<H', 3) + b'AB\0'
+    assert lines_of(tmp_path, fake_text) == []
 
-    声明长度只到最后一条 ShowText 的 opcode 之后，于是 i + 2 == script_len，
-    循环直接结束，那句话丢掉。刻意保留，此处只做钉桩。
-    """
+
+def test_complete_show_text_may_end_at_the_declared_boundary(tmp_path):
+    path = tmp_path / 'a.mjo'
+    path.write_bytes(build_mjo(show_text('末尾')))
+    assert extract_mjo(str(path)) == ['末尾']
+
+
+def test_show_text_outside_the_declared_boundary_is_dropped(tmp_path):
+    """声明范围里只剩 opcode，物理文件后的操作数不属于字节码。"""
     kept = show_text('残る') + dialog_close()
     dropped = show_text('消える')
     assert lines_of(tmp_path, kept + dropped,
                     declared_len=len(kept) + 2) == ['残る']
-    # 同样的字节码，只把声明长度放宽，那句话就回来了——证明上面丢的是边界
-    # 而不是别的原因。
     assert lines_of(tmp_path, kept + dropped) == ['残る', '消える']
 
 
@@ -260,6 +263,23 @@ def test_run_leaves_the_merged_text_alone_when_there_is_no_input(tmp_path):
     assert not (tmp_path / 'out').exists()     # 连输出目录都不建
 
 
+def test_run_leaves_the_merged_text_alone_when_all_inputs_fail(tmp_path):
+    src = tmp_path / 'src'
+    src.mkdir()
+    (src / 'bad.mjo').write_bytes(b'garbage')
+    (src / 'truncated.mjo').write_bytes(V1)
+    merged = tmp_path / MERGED_NAME
+    merged.write_text('上一次的成果', encoding='utf-8')
+    out = tmp_path / 'out'
+
+    result = run({'src_dir': str(src), 'out_dir': str(out)}, RunContext())
+
+    assert merged.read_text(encoding='utf-8') == '上一次的成果'
+    assert result.output_paths == []
+    assert [name for name, _ in result.failures] == ['bad.mjo', 'truncated.mjo']
+    assert '成功 0 个' in result.summary
+
+
 def test_run_says_so_instead_of_raising_when_the_dir_is_missing(tmp_path):
     """命令行直接调 run，没有 preview 那道闸。目录名敲错该得到一句话而不是
     traceback，也绝不能碰输出目录。"""
@@ -331,6 +351,80 @@ def test_cancel_is_not_swallowed_as_a_parse_failure(tmp_path):
     assert not (tmp_path / MERGED_NAME).exists()
 
 
+def test_atomic_text_write_keeps_the_previous_file_on_failure(tmp_path, monkeypatch):
+    import galtools.tools.mjo_text as mod
+
+    target = tmp_path / 'old.txt'
+    target.write_text('旧内容', encoding='utf-8')
+
+    def boom(_src, _dst):
+        raise OSError('替换失败')
+
+    monkeypatch.setattr(mod.os, 'replace', boom)
+    with pytest.raises(OSError, match='替换失败'):
+        mod.write_text_atomic(str(target), '新内容')
+    assert target.read_text(encoding='utf-8') == '旧内容'
+    assert os.listdir(str(tmp_path)) == ['old.txt']
+
+
+def test_cancel_after_the_last_parse_does_not_publish_merged(tmp_path, monkeypatch):
+    import galtools.tools.mjo_text as mod
+
+    src = tmp_path / 'src'
+    src.mkdir()
+    (src / 'a.mjo').write_bytes(build_mjo(show_text('あ')))
+    merged = tmp_path / MERGED_NAME
+    merged.write_text('旧全文', encoding='utf-8')
+    real_extract = mod.extract_mjo
+
+    class StopAfterParse(RunContext):
+        def __init__(self):
+            super().__init__()
+            self.parsed = False
+
+        def check_cancel(self):
+            if self.parsed:
+                raise Cancelled()
+
+    ctx = StopAfterParse()
+
+    def parsed(path):
+        result = real_extract(path)
+        ctx.parsed = True
+        return result
+
+    monkeypatch.setattr(mod, 'extract_mjo', parsed)
+    with pytest.raises(Cancelled) as caught:
+        run({'src_dir': str(src), 'out_dir': str(tmp_path / 'out')}, ctx)
+    assert merged.read_text(encoding='utf-8') == '旧全文'
+    assert caught.value.partial.output_paths == []
+
+
+def test_cancel_before_merged_publish_reports_written_files(tmp_path):
+    src = tmp_path / 'src'
+    src.mkdir()
+    (src / 'a.mjo').write_bytes(build_mjo(show_text('あ')))
+    merged = tmp_path / MERGED_NAME
+    merged.write_text('旧全文', encoding='utf-8')
+
+    class StopBeforeMerged(RunContext):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def check_cancel(self):
+            self.calls += 1
+            if self.calls == 4:
+                raise Cancelled()
+
+    with pytest.raises(Cancelled) as caught:
+        run({'src_dir': str(src), 'out_dir': str(tmp_path / 'out')},
+            StopBeforeMerged())
+    assert (tmp_path / 'out' / 'a.txt').exists()
+    assert merged.read_text(encoding='utf-8') == '旧全文'
+    assert caught.value.partial.output_paths == [str(tmp_path / 'out')]
+
+
 # ---------------- 命令行 ----------------
 def test_cli_exit_code_says_whether_anything_was_written(monkeypatch, tmp_path):
     """什么都没写出来就得非零退出，与 vndb_voiced/cli.py 同一套约定。以前不论
@@ -347,6 +441,9 @@ def test_cli_exit_code_says_whether_anything_was_written(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mod.sys, 'argv', ['mjo_text', str(src), str(out)])
     assert main() == 1                       # 目录在，但没有 .mjo
+
+    (src / 'bad.mjo').write_bytes(b'garbage')
+    assert main() == 1                       # 有输入，但一个都没解析成功
 
     (src / 'a.mjo').write_bytes(build_mjo(
         show_text('あ') + dialog_close() + PAD))

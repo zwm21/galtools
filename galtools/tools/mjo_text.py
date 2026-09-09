@@ -19,7 +19,7 @@ mjo 结构（MajiroObjV1.000，未加密）：
 输出：每个 mjo 一个 .txt（UTF-8），外加一个合并全文本。
 
 已知怪癖，均为既有行为，刻意保留：
-  * 主循环 `i + 2 < script_len` 会漏掉最后一个 opcode。
+  * 主循环不处理只剩两个字节的裸 opcode；带操作数的指令本来也已截断。
   * 合并全文写在输出目录的**父**目录；输出目录为相对路径时父目录为空串，
     退化成当前工作目录。
 
@@ -36,8 +36,9 @@ tests/manual/mjo_offset_diff.py。没有一个文件 count == 0，也就是说�
 import os
 import struct
 import sys
+import tempfile
 
-from ..core.context import RunContext
+from ..core.context import Cancelled, RunContext
 from ..core.paths import keep_drive_root
 from ..core.spec import DIR, Field, PreviewResult, RunResult, ToolSpec
 
@@ -56,19 +57,19 @@ MERGED_NAME = 'scenario_text_全文.txt'
 PARSE_ERRORS = (ValueError, OSError, struct.error)
 
 
-def is_valid_str(script, index):
-    """校验 index 处是否存在合法的 u16 前缀长度字符串"""
-    if index + 2 >= len(script):
+def is_valid_str(script, index, limit=None):
+    """校验 index 处的长度前缀字符串，所有字节必须落在逻辑脚本范围内。"""
+    limit = len(script) if limit is None else min(limit, len(script))
+    if index + 2 > limit:
         return False
     ln = struct.unpack_from('<H', script, index)[0]
-    if ln < 2 or index + ln + 2 >= len(script):
+    end = index + 2 + ln
+    if ln < 2 or end > limit:
         return False
     for i in range(ln - 1):
         if script[index + 2 + i] == 0:
             return False
-    if script[index + ln + 1] != 0:
-        return False
-    return True
+    return script[end - 1] == 0
 
 
 def extract_mjo(path):
@@ -101,7 +102,7 @@ def extract_mjo(path):
         cmd = struct.unpack_from('<H', script, i)[0]
         if cmd == ShowText:
             i += 2
-            if not is_valid_str(script, i):
+            if not is_valid_str(script, i, script_len):
                 continue
             ln = struct.unpack_from('<H', script, i)[0]
             try:
@@ -137,7 +138,11 @@ def extract_mjo(path):
                     finish()
             else:
                 pass
-        elif cmd == StringId or cmd == ParseStr:
+        elif cmd == StringId:
+            if i + 4 > script_len:
+                break
+            i += 4
+        elif cmd == ParseStr:
             i += 2
         else:
             i += 1
@@ -188,6 +193,26 @@ def list_mjo(src_dir):
     return sorted(f for f in os.listdir(src_dir) if f.lower().endswith('.mjo'))
 
 
+def write_text_atomic(path, text):
+    """在目标目录写完唯一临时文件后替换，异常时保留旧正式文件。"""
+    directory = os.path.dirname(os.path.abspath(path)) or '.'
+    fd, tmp = tempfile.mkstemp(prefix='.%s.' % os.path.basename(path),
+                               suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fp:
+            fd = None
+            fp.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def preview(params, ctx):
     src_dir, out_dir, merged_path = resolve_paths(params)
     if not os.path.isdir(src_dir):
@@ -228,29 +253,52 @@ def run(params, ctx):
     os.makedirs(out_dir, exist_ok=True)
 
     total_lines = 0
-    merged = []
+    succeeded = []
     failed = []
-    for idx, name in enumerate(files):
+    try:
+        for idx, name in enumerate(files):
+            ctx.check_cancel()
+            ctx.progress(idx, len(files), '提取 %s' % name)
+            path = os.path.join(src_dir, name)
+            try:
+                lines = extract_mjo(path)
+            except PARSE_ERRORS as e:
+                failed.append((name, str(e)))
+                continue
+            ctx.check_cancel()
+            total_lines += len(lines)
+            stem = os.path.splitext(name)[0]
+            write_text_atomic(os.path.join(out_dir, stem + '.txt'), '\n'.join(lines))
+            succeeded.append((stem, lines))
         ctx.check_cancel()
-        ctx.progress(idx, len(files), '提取 %s' % name)
-        path = os.path.join(src_dir, name)
-        try:
-            lines = extract_mjo(path)
-        except PARSE_ERRORS as e:
-            failed.append((name, str(e)))
-            continue
-        total_lines += len(lines)
-        stem = os.path.splitext(name)[0]
-        with open(os.path.join(out_dir, stem + '.txt'), 'w', encoding='utf-8') as o:
-            o.write('\n'.join(lines))
-        merged.append(f'{"=" * 60}\n【{stem}】\n{"=" * 60}\n' + '\n'.join(lines) + '\n')
-    ctx.progress(len(files), len(files), '写出合并全文')
+    except Cancelled as stop:
+        stop.partial = RunResult(
+            summary='已写出 %d / %d 个脚本文本，合并全文未改动。'
+                    % (len(succeeded), len(files)),
+            output_paths=[out_dir] if succeeded else [], failures=failed)
+        raise
 
-    with open(merged_path, 'w', encoding='utf-8') as o:
-        o.write('\n'.join(merged))
+    if not succeeded:
+        parts = ['处理 %d 个 mjo，成功 0 个，合并全文未改动' % len(files),
+                 '失败列表:']
+        parts.extend('  %s: %s' % (n, e) for n, e in failed)
+        return RunResult(summary='\n'.join(parts), failures=failed)
+
+    try:
+        ctx.progress(len(files), len(files), '写出合并全文')
+        merged = [f'{"=" * 60}\n【{stem}】\n{"=" * 60}\n'
+                  + '\n'.join(lines) + '\n' for stem, lines in succeeded]
+        ctx.check_cancel()
+        write_text_atomic(merged_path, '\n'.join(merged))
+    except Cancelled as stop:
+        stop.partial = RunResult(
+            summary='已写出 %d / %d 个脚本文本，合并全文未改动。'
+                    % (len(succeeded), len(files)),
+            output_paths=[out_dir], failures=failed)
+        raise
 
     parts = ['处理 %d 个 mjo，成功 %d 个，共提取 %d 条文本'
-             % (len(files), len(files) - len(failed), total_lines)]
+             % (len(files), len(succeeded), total_lines)]
     if failed:
         parts.append('失败列表:')
         parts.extend('  %s: %s' % (n, e) for n, e in failed)
@@ -287,10 +335,7 @@ def main():
     # 走 ConsoleContext 会多出 \r 进度行，破坏既有 stdout 格式。
     result = run({'src_dir': src_dir, 'out_dir': out_dir}, RunContext())
     print(result.summary)
-    # 一个文件都没写出来时以非零退出，与 vndb_voiced/cli.py 同一套约定，好让脚本
-    # 里的 && 断开：目录不存在、目录不可读、目录里没有 .mjo 这三种都没产出。
-    # 有文件但全都解析失败仍算 0——txt 目录与合并全文照样写了（合并全文是空的），
-    # 失败清单在 summary 里。要区分那种情况得看 failures，不在退出码里表达。
+    # 一个文件都没真正解析成功时非零退出，旧合并全文保持原样。
     return 0 if result.output_paths else 1
 
 
