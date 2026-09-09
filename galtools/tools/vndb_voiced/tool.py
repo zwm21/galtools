@@ -189,6 +189,7 @@ def _update_batch(params, ctx):
         if not errors:
             # 与 ensure_credits 同一口径：抖一次网造成的残缺名单不缓存，
             # 否则用户再点一次「查询」拿回的仍是同一份残缺。
+            ctx.check_cancel()
             ctx.session[UPDATE_STAFFS_KEY] = (key, staffs)
     items, hard = fetch.ensure_credits(staffs, ctx, client)
     by_label = {staff.label(): staff.sid for staff in staffs}
@@ -266,6 +267,7 @@ def _run_update(params, ctx):
             failures.append((label, 'vndb 上抓到 0 条，保留旧文件'))
         elif entry.status == update.CHANGED:
             try:
+                ctx.check_cancel()
                 store.write_person(db_dir, entry.fresh)
             except (store.BadFile, OSError) as e:
                 ctx.log('%s 没写进本地库：%s' % (label, e), 'warn')
@@ -406,6 +408,7 @@ def _save_to_db(db_dir, ctx, items):
                 skipped.append(item.staff.sid)
                 continue
         try:
+            ctx.check_cancel()
             store.write_person(db_dir, item)
         except (store.BadFile, OSError) as e:
             ctx.log('%s 没写进本地库：%s' % (item.staff.label(), e), 'warn')

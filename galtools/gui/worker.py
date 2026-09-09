@@ -91,12 +91,17 @@ class JobRunner:
         self._pending = None
         self._next_token = 0
         self._current_token = 0
+        self._state = 'idle'
         self._closing = False
         bridge.job_exited.connect(self._on_job_exited)
 
     @property
     def busy(self):
         return self._active is not None or self._pending is not None
+
+    @property
+    def state(self):
+        return self._state
 
     @property
     def kind(self):
@@ -111,16 +116,17 @@ class JobRunner:
         pending = self._pending
         if pending is not None and pending.kind == 'run':
             self._pending = None
-            if self._active is not None:
-                self._current_token = self._active.token
-            else:
-                self._current_token = 0
             emit(self.bridge.run_cancelled, pending.token, None)
         if self._active is not None:
             self._active.cancel.set()
+            self._state = 'cancelling'
+        elif self._pending is None:
+            self._current_token = 0
+            self._state = 'idle'
 
     def stop(self):
         self._closing = True
+        self._state = 'closing'
         self._pending = None
         self._current_token = 0
         if self._active is not None:
@@ -141,13 +147,16 @@ class JobRunner:
     def _submit(self, kind, spec, params, session):
         if self._closing:
             return 0
+        if kind == 'preview' and (
+                (self._active is not None and self._active.kind == 'run')
+                or (self._pending is not None and self._pending.kind == 'run')):
+            return 0
         request = self._new_request(kind, spec, params, session)
         if self._active is not None:
-            if self._pending is not None and self._pending.kind == 'run' and kind == 'preview':
-                return self._pending.token
             self._pending = request
             self._current_token = request.token
             self._active.cancel.set()
+            self._state = 'cancelling'
             return request.token
         self._current_token = request.token
         self._start(request)
@@ -156,6 +165,7 @@ class JobRunner:
     def _start(self, request):
         job = _Job(request, threading.Event())
         self._active = job
+        self._state = request.kind
         ctx = GuiContext(self.bridge, request.token, job.cancel, request.session)
 
         def work():
@@ -168,9 +178,9 @@ class JobRunner:
             job.thread.join()
             emit(self.bridge.job_exited, request.token)
 
-        job.thread = threading.Thread(target=work, daemon=True)
+        job.thread = threading.Thread(target=work)
         job.thread.start()
-        threading.Thread(target=reap, daemon=True).start()
+        threading.Thread(target=reap).start()
 
     def _run_preview(self, request, ctx):
         try:
@@ -200,11 +210,12 @@ class JobRunner:
             return
         self._active = None
         if self._closing:
+            self._state = 'closing'
             emit(self.bridge.idle)
             return
         if self._pending is None:
-            if self._current_token == token:
-                self._current_token = 0
+            self._current_token = 0
+            self._state = 'idle'
             emit(self.bridge.idle)
             return
         request, self._pending = self._pending, None

@@ -9,9 +9,9 @@ import os
 
 import pytest
 
-from galtools.core.context import RunContext
+from galtools.core.context import Cancelled, RunContext
 from galtools.tools import vndb_voiced as tool
-from galtools.tools.vndb_voiced import api, cli, fetch, store, update
+from galtools.tools.vndb_voiced import api, cli, fetch, store, tool as tool_impl, update
 from galtools.tools.vndb_voiced.model import Credit, Staff, StaffCredits
 
 import test_vndb_voiced as online
@@ -195,6 +195,33 @@ def test_update_all_run_reuses_the_preview_fetch(monkeypatch, tmp_path):
     assert calls > 0
     tool.run(update_params(tmp_path), ctx)
     assert len(fake.calls) == calls             # run 零请求，全走缓存
+
+
+def test_update_all_checks_cancel_before_each_write(monkeypatch, tmp_path):
+    seed_library(monkeypatch, tmp_path, 's1', 's2')
+    entries = []
+    for sid in ('s1', 's2'):
+        old = store.read_person(str(tmp_path), sid)
+        fresh = make_fresh(sid=sid, name=old.staff.name + ' New',
+                           original=old.staff.original, credits=old.credits)
+        entries.append(update.build_entries([old], {sid: fresh}, {})[0])
+
+    class CancelSecond(RunContext):
+        def __init__(self):
+            super().__init__()
+            self.checks = 0
+
+        def check_cancel(self):
+            self.checks += 1
+            if self.checks == 2:
+                raise Cancelled()
+
+    monkeypatch.setattr(tool_impl, '_update_batch',
+                        lambda _params, _ctx: (entries, [], ''))
+    with pytest.raises(Cancelled):
+        tool_impl._run_update(update_params(tmp_path), CancelSecond())
+    assert store.read_person(str(tmp_path), 's1').staff.name.endswith(' New')
+    assert not store.read_person(str(tmp_path), 's2').staff.name.endswith(' New')
 
 
 def test_update_all_never_replaces_a_person_with_zero_credits(monkeypatch,

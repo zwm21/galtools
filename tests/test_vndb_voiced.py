@@ -17,7 +17,7 @@ import pytest
 from galtools.core.context import Cancelled, RunContext
 from galtools.core.spec import RunResult
 from galtools.tools import vndb_voiced as tool
-from galtools.tools.vndb_voiced import api, cli, fetch, store, tables, xlsx
+from galtools.tools.vndb_voiced import api, cli, fetch, store, tables, tool as tool_impl, xlsx
 from galtools.tools.vndb_voiced.model import (
     Common, Credit, Resolution, Staff, StaffCredits, label, released_sort_key,
     url_for,
@@ -606,6 +606,44 @@ def test_ensure_credits_isolates_one_persons_failure(monkeypatch):
     assert len(fake.calls) > spent      # 残缺结果不进缓存，再点一次真的重抓
 
 
+def test_cancel_before_resolve_cache_commit(monkeypatch):
+    FakeApi(vndb()).install(monkeypatch)
+    ctx = CountingCtx(10 ** 9)
+    real = fetch.resolve_target
+
+    def cancel_after_fetch(target, client):
+        result = real(target, client)
+        ctx.after = ctx.checks + 1
+        return result
+
+    monkeypatch.setattr(fetch, 'resolve_target', cancel_after_fetch)
+    with pytest.raises(Cancelled):
+        fetch.ensure_resolved({'staff': 's1'}, ctx)
+    assert 'resolve' not in ctx.session
+
+
+def test_cancel_before_counts_cache_commit(monkeypatch):
+    FakeApi(vndb()).install(monkeypatch)
+    ctx = CountingCtx(10 ** 9)
+    client = api.Client(ctx)
+    staff = fetch.load_staff('s1', client)
+    real = client.count
+    calls = 0
+
+    def cancel_after_second_count(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = real(*args, **kwargs)
+        if calls == 2:
+            ctx.after = ctx.checks + 1
+        return result
+
+    monkeypatch.setattr(client, 'count', cancel_after_second_count)
+    with pytest.raises(Cancelled):
+        fetch.ensure_counts(staff, ctx, client)
+    assert ctx.session.get('counts') == {}
+
+
 def test_ensure_credits_caches_a_clean_fetch(monkeypatch):
     """全成功才缓存——不能因为「失败的不缓存」把缓存本身取消掉，预览之后紧接着
     run 的那次复用全靠它。"""
@@ -633,6 +671,24 @@ def test_ensure_credits_refetches_when_the_people_change(monkeypatch):
     items, _ = fetch.ensure_credits([one, two], ctx, client)
     assert [i.staff.sid for i in items] == ['s1', 's2']
     assert len(fake.calls) > spent
+
+
+def test_cancel_before_credits_cache_commit(monkeypatch):
+    FakeApi(vndb()).install(monkeypatch)
+    ctx = CountingCtx(10 ** 9)
+    client = api.Client(ctx)
+    staff = fetch.load_staff('s1', client)
+    real = fetch.fetch_credits
+
+    def cancel_after_fetch(*args, **kwargs):
+        result = real(*args, **kwargs)
+        ctx.after = ctx.checks + 1
+        return result
+
+    monkeypatch.setattr(fetch, 'fetch_credits', cancel_after_fetch)
+    with pytest.raises(Cancelled):
+        fetch.ensure_credits([staff], ctx, client)
+    assert 'credits' not in ctx.session
 
 
 def test_cancel_propagates_through_ensure_credits(monkeypatch):
@@ -1360,6 +1416,15 @@ def test_a_workbook_failure_does_not_lose_the_db(monkeypatch, tmp_path):
     assert result.output_paths == [str(db)]
     assert '写 Excel 失败' in result.summary
     assert [n for n, _ in result.failures] == ['写 Excel']
+
+
+def test_cancel_before_each_db_write_keeps_uncommitted_people(monkeypatch, tmp_path):
+    items = [person('s1', [credit('v1', 'A', 'c1')]),
+             person('s2', [credit('v2', 'B', 'c2')])]
+    ctx = CountingCtx(after=2)
+    with pytest.raises(Cancelled):
+        tool_impl._save_to_db(str(tmp_path), ctx, items)
+    assert os.listdir(str(tmp_path)) == ['s1.json']
 
 
 def test_a_persons_db_write_failure_only_blames_himself(monkeypatch, tmp_path):

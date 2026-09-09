@@ -430,7 +430,7 @@ class MainWindow(QMainWindow):
 
     # ---------- 预览与执行 ----------
     def _request_preview(self, page):
-        if page is not self._active_page or self.runner.kind == 'run':
+        if page is not self._active_page or self.runner.busy and self.runner.kind == 'run':
             return
         if page.validation_errors():
             return
@@ -544,7 +544,7 @@ class MainWindow(QMainWindow):
         self._show_run_result(result, page)
 
     def _on_run_cancelled(self, token, partial):
-        if token != self._run_token:
+        if token != self._run_token or not self.runner.is_current(token):
             return
         self._run_token = 0
         page = self._finish_run()

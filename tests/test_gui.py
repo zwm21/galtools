@@ -24,7 +24,7 @@ from PySide6.QtWidgets import QApplication                     # noqa: E402
 
 from galtools.core.context import Cancelled                    # noqa: E402
 from galtools.core.spec import (                                # noqa: E402
-    TEXT, Field, PreviewResult, RunResult, ToolSpec,
+    TEXT, Field, PreviewResult, RunResult, Table, ToolSpec,
 )
 from galtools.gui import main_window as mw                     # noqa: E402
 from galtools.gui.form import normalize_path                   # noqa: E402
@@ -85,13 +85,15 @@ def test_superseded_queued_events_are_ignored(qt_app):
 
     old_token = runner.request_preview(preview_spec(old_preview), {}, {})
     assert started.wait(5)
+    qt_app.processEvents()
+    assert seen == [(old_token, '旧日志')]
     new_token = runner.request_preview(
         preview_spec(lambda _params, _ctx: PreviewResult(summary='新结果')), {}, {})
     assert new_token != old_token
     release.set()
     assert wait_until(qt_app, lambda: not runner.busy)
     assert not runner.is_current(old_token)
-    assert all(token != old_token for token, _msg in seen)
+    assert seen == [(old_token, '旧日志')]
 
 
 def test_jobs_are_serialized_and_pending_run_can_be_cancelled(qt_app):
@@ -101,27 +103,90 @@ def test_jobs_are_serialized_and_pending_run_can_be_cancelled(qt_app):
     preview_release = threading.Event()
     run_started = threading.Event()
     cancelled = []
+    logs = []
     bridge.run_cancelled.connect(
         lambda token, partial: cancelled.append((token, partial)), Qt.DirectConnection)
+    bridge.log.connect(
+        lambda token, msg, _level: logs.append((token, msg))
+        if runner.is_current(token) else None)
 
-    def slow_preview(_params, _ctx):
+    def slow_preview(_params, ctx):
         preview_started.set()
         preview_release.wait(5)
+        ctx.log('取消后的旧日志')
         return PreviewResult()
 
     def run(_params, _ctx):
         run_started.set()
         return RunResult()
 
-    runner.request_preview(preview_spec(slow_preview), {}, {})
+    preview_token = runner.request_preview(preview_spec(slow_preview), {}, {})
     assert preview_started.wait(5)
     run_token = runner.start_run(spec_with(run), {}, {})
     assert runner.kind == 'run'
+    assert runner.state == 'cancelling'
     runner.cancel()
+    assert not runner.is_current(preview_token)
     preview_release.set()
     assert wait_until(qt_app, lambda: not runner.busy)
     assert not run_started.is_set()
+    assert logs == []
     assert [token for token, _partial in cancelled] == [run_token]
+
+
+def test_pending_run_starts_only_after_old_preview_exits(qt_app):
+    bridge = Bridge()
+    runner = JobRunner(bridge)
+    preview_started = threading.Event()
+    preview_release = threading.Event()
+    run_started = threading.Event()
+
+    def slow_preview(_params, _ctx):
+        preview_started.set()
+        preview_release.wait(5)
+        return PreviewResult()
+
+    runner.request_preview(preview_spec(slow_preview), {}, {})
+    assert preview_started.wait(5)
+    run_token = runner.start_run(
+        spec_with(lambda _params, _ctx: run_started.set() or RunResult()), {}, {})
+    assert runner.is_current(run_token)
+    assert not run_started.is_set()
+    assert runner.request_preview(preview_spec(lambda *_: PreviewResult()), {}, {}) == 0
+    assert not run_started.is_set()
+    preview_release.set()
+    assert wait_until(qt_app, run_started.is_set)
+    assert wait_until(qt_app, lambda: not runner.busy)
+    assert runner.state == 'idle'
+
+
+def test_stop_drops_pending_and_waits_for_active_exit(qt_app):
+    bridge = Bridge()
+    runner = JobRunner(bridge)
+    preview_started = threading.Event()
+    preview_release = threading.Event()
+    run_started = threading.Event()
+    idle = []
+    bridge.idle.connect(lambda: idle.append(True))
+
+    def slow_preview(_params, _ctx):
+        preview_started.set()
+        preview_release.wait(5)
+        return PreviewResult()
+
+    runner.request_preview(preview_spec(slow_preview), {}, {})
+    assert preview_started.wait(5)
+    runner.start_run(
+        spec_with(lambda _params, _ctx: run_started.set() or RunResult()), {}, {})
+    runner.stop()
+    assert runner.state == 'closing'
+    assert runner.request_preview(preview_spec(lambda *_: PreviewResult()), {}, {}) == 0
+    qt_app.processEvents()
+    assert idle == []
+    preview_release.set()
+    assert wait_until(qt_app, lambda: idle == [True])
+    assert not run_started.is_set()
+    assert not runner.busy
 
 
 def test_cancelling_a_run_reports_the_partial_result(qt_app):
@@ -182,6 +247,7 @@ def test_starting_a_run_takes_over_the_progress_bar(qt_app, monkeypatch,
         assert page.validation_errors() == {}          # 证明起跑不会被校验拦下
         monkeypatch.setattr(win.runner, 'start_run',
                             lambda *a, **k: 23)       # 不真起线程
+        monkeypatch.setattr(win.runner, 'is_current', lambda token: token == 23)
 
         win.progress.setMaximum(0)                  # 预览留下的无限滚动
         assert win.progress.maximum() == 0
@@ -282,11 +348,36 @@ def test_hidden_page_cannot_request_a_preview(qt_app, monkeypatch, tmp_path):
     try:
         hidden = win.pages['seiyuu_db']
         active = win.pages['mjo_text']
+        hidden._debounce.start()
+        assert hidden._debounce.isActive()
+        win._active_page = hidden
+        win._on_tool_selected(win.tree.topLevelItem(0).child(0), None)
+        hidden.stop_debounce()
+        assert not hidden._debounce.isActive()
         win._active_page = active
         calls = []
         monkeypatch.setattr(win.runner, 'request_preview',
                             lambda *args: calls.append(args))
         win._request_preview(hidden)
+        assert calls == []
+    finally:
+        win.close()
+
+
+def test_hidden_preview_signal_cannot_cancel_a_running_job(qt_app, monkeypatch,
+                                                            tmp_path):
+    win = window(monkeypatch, tmp_path)
+    try:
+        hidden = win.pages['seiyuu_db']
+        active = win.pages['mjo_text']
+        win._active_page = active
+        monkeypatch.setattr(type(win.runner), 'busy', property(lambda _self: True))
+        monkeypatch.setattr(type(win.runner), 'kind', property(lambda _self: 'run'))
+        calls = []
+        monkeypatch.setattr(win.runner, 'request_preview',
+                            lambda *args: calls.append(args))
+        hidden.previewRequested.emit()
+        qt_app.processEvents()
         assert calls == []
     finally:
         win.close()
@@ -300,16 +391,50 @@ def test_cancelled_result_keeps_outputs_and_diagnostics(qt_app, monkeypatch,
         page.set_busy(True)
         win._active_page = page
         win._run_token = 41
+        monkeypatch.setattr(win.runner, 'is_current', lambda token: token == 41)
         output = tmp_path / 'partial'
         output.mkdir()
         partial = RunResult(summary='完成一半', output_paths=[str(output)],
-                            warnings=['注意'], failures=[('x', '失败')])
+                            warnings=['注意'], failures=[('x', '失败')],
+                            table=Table(columns=('列',), rows=[('半份数据',)]))
         win._on_run_cancelled(41, partial)
         assert win.status.text() == '已取消'
         assert win.open_btn.isEnabled()
+        assert page.table.rowCount() == 1
+        assert page.table.item(0, 0).text() == '半份数据'
         text = win.log.toPlainText()
         assert '完成一半' in text and '注意' in text and '失败' in text
     finally:
+        win.close()
+
+
+def test_stale_main_window_events_are_all_ignored(qt_app, monkeypatch, tmp_path):
+    win = window(monkeypatch, tmp_path)
+    try:
+        page = win.pages['mjo_text']
+        win._active_page = page
+        win._run_token = 91
+        current = 92
+        monkeypatch.setattr(win.runner, 'is_current', lambda token: token == current)
+        win._preview_requests[91] = (page, {})
+        before_log = win.log.toPlainText()
+        before_status = win.status.text()
+        before_progress = win.progress.value()
+
+        win._on_log(91, '旧日志', 'warn')
+        win._on_progress(91, 8, 10, '旧进度')
+        win._on_preview_ready(91, PreviewResult(summary='旧预览'))
+        win._on_run_finished(91, RunResult(summary='旧完成'))
+        win._on_run_cancelled(91, RunResult(summary='旧取消'))
+        win._on_run_failed(91, '旧错误')
+
+        assert win.log.toPlainText() == before_log
+        assert win.status.text() == before_status
+        assert win.progress.value() == before_progress
+        assert page.preview_box.toPlainText() != '旧预览'
+        assert win._run_token == 91
+    finally:
+        win._run_token = 0
         win.close()
 
 

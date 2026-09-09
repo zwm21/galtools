@@ -301,6 +301,7 @@ def ensure_resolved(params, ctx, client=None):
     if client is None:
         client = api.Client(ctx)
     out = [resolve_target(t, client) for t in targets]
+    ctx.check_cancel()
     ctx.session['resolve'] = (key, out)
     return out
 
@@ -313,8 +314,10 @@ def ensure_counts(staff, ctx, client):
     """
     slot = ctx.session.setdefault('counts', {})
     if staff.sid not in slot:
-        slot[staff.sid] = (client.count('character', char_filter(staff.sid)),
-                           client.count('vn', vn_filter(staff.sid)))
+        value = (client.count('character', char_filter(staff.sid)),
+                 client.count('vn', vn_filter(staff.sid)))
+        ctx.check_cancel()
+        slot[staff.sid] = value
     return slot[staff.sid]
 
 
@@ -372,6 +375,7 @@ def ensure_credits(staffs, ctx, client=None):
         # 只缓存完整的成功。抖一次网就把残缺结果缓存住的话，用户再点一次
         # 「开始」是零请求、同一份残缺结果、再多一个 _1 文件，除非他想到去勾
         # 「重新抓取」。ensure_counts 的口径也是只有成功才落缓存。
+        ctx.check_cancel()
         ctx.session['credits'] = (key, (items, failures))
     return items, failures
 
