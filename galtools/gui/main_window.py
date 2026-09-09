@@ -155,6 +155,9 @@ class ToolPage(QWidget):
         else:
             self.runRequested.emit()
 
+    def stop_debounce(self):
+        self._debounce.stop()
+
     def mark_stale(self, reason=None):
         if not self.has_rescan or self.spec.preview is None:
             return
@@ -269,11 +272,12 @@ class MainWindow(QMainWindow):
         self.bridge = Bridge()
         self.runner = JobRunner(self.bridge)
         self.pages = {}
-        self._preview_page = None
-        self._preview_params = {}
+        self._preview_requests = {}
         self._active_page = None
+        self._run_token = 0
         self._outputs = []
         self._run_started = 0.0
+        self._close_pending = False
 
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
@@ -330,13 +334,14 @@ class MainWindow(QMainWindow):
         self.clear_btn.clicked.connect(self.log.clear)
         self.tree.currentItemChanged.connect(self._on_tool_selected)
 
-        self.bridge.log.connect(self._append_log)
+        self.bridge.log.connect(self._on_log)
         self.bridge.progress.connect(self._on_progress)
         self.bridge.preview_ready.connect(self._on_preview_ready)
         self.bridge.preview_failed.connect(self._on_preview_failed)
         self.bridge.run_finished.connect(self._on_run_finished)
         self.bridge.run_cancelled.connect(self._on_run_cancelled)
         self.bridge.run_failed.connect(self._on_run_failed)
+        self.bridge.idle.connect(self._on_runner_idle)
 
         self._load_tools()
         self._restore_geometry()
@@ -391,15 +396,28 @@ class MainWindow(QMainWindow):
             self.resize(1000, 720)
 
     def closeEvent(self, event):
-        # 先停活再存设置：留着的线程会在窗口析构后 emit 到已删除的 Bridge。
-        self.runner.stop()
+        if self.runner.busy:
+            self._close_pending = True
+            self.runner.stop()
+            self.status.setText('正在取消任务，完成后关闭窗口…')
+            event.ignore()
+            return
         self.settings.setValue('window/geometry', self.saveGeometry())
         super().closeEvent(event)
 
+    def _on_runner_idle(self):
+        if self._close_pending:
+            self._close_pending = False
+            self.close()
+
     # ---------- 工具切换 ----------
-    def _on_tool_selected(self, current, _previous):
+    def _on_tool_selected(self, current, previous):
         if current is None:
             return
+        if previous is not None:
+            previous_index = previous.data(0, Qt.UserRole)
+            if previous_index is not None:
+                self.stack.widget(previous_index).stop_debounce()
         index = current.data(0, Qt.UserRole)
         if index is None:
             return
@@ -412,27 +430,41 @@ class MainWindow(QMainWindow):
 
     # ---------- 预览与执行 ----------
     def _request_preview(self, page):
-        if self.runner.busy and page.busy:
+        if page is not self._active_page or self.runner.kind == 'run':
             return
         if page.validation_errors():
             return
-        self._preview_page = page
-        self._preview_params = page.form.values()
-        self.runner.request_preview(page.spec, self._preview_params, page.session)
+        params = page.form.values()
+        token = self.runner.request_preview(page.spec, params, page.session)
+        if token:
+            self._preview_requests[token] = (page, params)
 
-    def _on_preview_ready(self, gen, result):
-        if not self.runner.is_current_preview(gen) or self._preview_page is None:
+    def _take_preview(self, token):
+        request = self._preview_requests.pop(token, None)
+        stale = [key for key in self._preview_requests if key < token]
+        for key in stale:
+            self._preview_requests.pop(key, None)
+        if not self.runner.is_current(token):
+            return None
+        return request
+
+    def _on_preview_ready(self, token, result):
+        request = self._take_preview(token)
+        if request is None:
             return
-        self._preview_page.show_preview(result)
+        page, params = request
+        page.show_preview(result)
         # 预览跑通就说明这些目录是能读的，记下来。只看不导的用法从不点「开始」，
         # 光靠 _start_run 里的 remember_paths 的话，路径每次开界面都得重新粘。
-        self._preview_page.form.remember_dirs(self._preview_params)
+        page.form.remember_dirs(params)
         self._idle()
 
-    def _on_preview_failed(self, gen, msg):
-        if not self.runner.is_current_preview(gen) or self._preview_page is None:
+    def _on_preview_failed(self, token, msg):
+        request = self._take_preview(token)
+        if request is None:
             return
-        self._preview_page.show_preview_error(msg)
+        page, _params = request
+        page.show_preview_error(msg)
         # 预览一开头的 progress(0, 0, …) 把进度条切成了无限滚动，失败时也得收
         # 回来，否则它会一直滚、状态栏也一直停在「正在查…」。
         self._idle('预览失败')
@@ -448,6 +480,8 @@ class MainWindow(QMainWindow):
             page.form.set_errors(errors)
             return
         params = page.form.values()
+        for candidate in self.pages.values():
+            candidate.stop_debounce()
         page.form.remember_paths()
         page.set_busy(True)
         self.tree.setEnabled(False)
@@ -461,7 +495,7 @@ class MainWindow(QMainWindow):
         self._run_started = time.monotonic()
         self._active_page = page
         self._append_log('开始：%s' % page.spec.name, 'ok')
-        self.runner.start_run(page.spec, params, page.session)
+        self._run_token = self.runner.start_run(page.spec, params, page.session)
 
     def _cancel_run(self):
         self._append_log('正在取消…', 'warn')
@@ -479,12 +513,9 @@ class MainWindow(QMainWindow):
         self.tree.setEnabled(True)
         return page
 
-    def _on_run_finished(self, result):
-        page = self._finish_run()
-        elapsed = time.monotonic() - self._run_started
-        self.progress.setMaximum(100)
-        self.progress.setValue(100)
-        self.status.setText('完成，耗时 %.1f 秒' % elapsed)
+    def _show_run_result(self, result, page, level='ok'):
+        if result is None:
+            return
         for warning in result.warnings:
             self._append_log(warning, 'warn')
         if result.failures:
@@ -494,27 +525,49 @@ class MainWindow(QMainWindow):
             if len(result.failures) > MAX_LOGGED_FAILURES:
                 self._append_log('  …其余 %d 项见输出目录内的清单'
                                  % (len(result.failures) - MAX_LOGGED_FAILURES), 'warn')
-        self._append_log(result.summary, 'ok')
-        # 必须在 _finish_run 之后：那里的 mark_stale 会把表收起来。
+        if result.summary:
+            self._append_log(result.summary, level)
         if page is not None:
             page.show_table(result.table)
         self._outputs = list(result.output_paths)
         self.open_btn.setEnabled(bool(self._outputs))
 
-    def _on_run_cancelled(self, partial):
-        self._finish_run()
+    def _on_run_finished(self, token, result):
+        if token != self._run_token or not self.runner.is_current(token):
+            return
+        self._run_token = 0
+        page = self._finish_run()
+        elapsed = time.monotonic() - self._run_started
+        self.progress.setMaximum(100)
+        self.progress.setValue(100)
+        self.status.setText('完成，耗时 %.1f 秒' % elapsed)
+        self._show_run_result(result, page)
+
+    def _on_run_cancelled(self, token, partial):
+        if token != self._run_token:
+            return
+        self._run_token = 0
+        page = self._finish_run()
         self.status.setText('已取消')
         self._append_log('已取消。已经写出的文件保留在输出目录中。', 'warn')
-        if partial is not None and partial.summary:
-            self._append_log(partial.summary, 'warn')
+        self._show_run_result(partial, page, 'warn')
 
-    def _on_run_failed(self, tb):
+    def _on_run_failed(self, token, tb):
+        if token != self._run_token or not self.runner.is_current(token):
+            return
+        self._run_token = 0
         self._finish_run()
         self.status.setText('出错')
         self._append_log(tb, 'error')
 
     # ---------- 底部面板 ----------
-    def _on_progress(self, done, total, note):
+    def _on_log(self, token, msg, level):
+        if self.runner.is_current(token):
+            self._append_log(msg, level)
+
+    def _on_progress(self, token, done, total, note):
+        if not self.runner.is_current(token):
+            return
         if total <= 0:
             self.progress.setMaximum(0)
         else:

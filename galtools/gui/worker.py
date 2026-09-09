@@ -1,38 +1,24 @@
 # -*- coding: utf-8 -*-
-"""把工具的执行搬到后台线程，结果经 Qt 信号回到界面线程。
+"""在后台串行执行工具，并用任务 token 隔离过期的 Qt 队列事件。
 
-用标准库 threading.Thread 而非 QThread：已实测普通线程里 emit 信号能正常
-跨线程投递，这样就不必操心 QThread 的对象归属与生命周期。
-
-预览与执行串行进行——新请求先取消旧线程再等它退出。等待有上限（JOIN_TIMEOUT），
-卡在一个网络请求里的旧线程可能活过这次等待，所以正确性不能只靠这个 join：每份活
-带一个编号，编号过期后它发的日志、进度与结果一律丢弃，否则上一轮的进度条和日志会
-插到下一轮里。工具侧也只在扫描完成时一次性写 ctx.session，被取消的活到不了那一步。
+同一时刻只允许一个线程访问工具 session 或写盘。新请求只会取消当前任务并成为
+唯一 pending；当前线程真正退出后才启动它。UI 线程从不 join，网络阻塞时窗口仍可
+响应。所有信号都携带 token，接收端必须再次核对，不能只依赖 emit 前过滤。
 """
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, Signal
 
 from ..core.context import Cancelled, RunContext
 
-# 进度信号合流间隔：逐文件 emit 上千次会把日志控件拖死。
 PROGRESS_INTERVAL = 0.1
-# 等旧线程退出的上限。这是在界面线程上等的，所以宁短勿长——工具在循环里
-# check_cancel，正常情况几毫秒就退出；真卡在 socket 上的那种等多久都没用，
-# 交给上面说的活计编号兜住。
-JOIN_TIMEOUT = 1.0
 
 
 def emit(signal, *args):
-    """发信号，但容忍 Bridge 已经没了。
-
-    stop() 只等 JOIN_TIMEOUT 那一秒，卡在一个网络请求里的工具会超时；等它醒过来时
-    窗口已关、Bridge 已析构，emit 会抛 RuntimeError: Signal source has been
-    deleted，在后台线程里变成一段没人能处理的栈。这时候的结果本就没人要了，
-    咽掉即可。
-    """
+    """发信号，但容忍窗口关闭后 Bridge 已析构。"""
     try:
         signal.emit(*args)
     except RuntimeError:
@@ -40,127 +26,186 @@ def emit(signal, *args):
 
 
 class Bridge(QObject):
-    log = Signal(str, str)                 # 消息, 级别
-    progress = Signal(int, int, str)       # 已完成, 总数, 说明
-    preview_ready = Signal(int, object)    # 代次, PreviewResult
-    preview_failed = Signal(int, str)      # 代次, 错误消息
-    run_finished = Signal(object)          # RunResult
-    run_cancelled = Signal(object)         # 取消时已完成的部分，可能为 None
-    run_failed = Signal(str)               # 栈信息
+    log = Signal(int, str, str)               # token, 消息, 级别
+    progress = Signal(int, int, int, str)     # token, 已完成, 总数, 说明
+    preview_ready = Signal(int, object)       # token, PreviewResult
+    preview_failed = Signal(int, str)         # token, 错误消息
+    run_finished = Signal(int, object)        # token, RunResult
+    run_cancelled = Signal(int, object)       # token, partial
+    run_failed = Signal(int, str)             # token, 栈信息
+    job_exited = Signal(int)                  # token；工作线程已 join
+    idle = Signal()                           # active/pending 都已清空
 
 
 class GuiContext(RunContext):
-    def __init__(self, bridge, cancel_event, session, alive=None):
+    def __init__(self, bridge, token, cancel_event, session):
         super().__init__(session)
         self._bridge = bridge
+        self._token = token
         self._cancel = cancel_event
-        self._alive = alive
         self._last_emit = 0.0
 
-    def _superseded(self):
-        return self._alive is not None and not self._alive()
-
     def log(self, msg, level='info'):
-        if self._superseded():
-            return
-        emit(self._bridge.log, msg, level)
+        emit(self._bridge.log, self._token, msg, level)
 
     def progress(self, done, total, note=''):
-        if self._superseded():
-            return
         now = time.monotonic()
-        # 最后一次必须送达，中间的按间隔丢弃。
         if done < total and now - self._last_emit < PROGRESS_INTERVAL:
             return
         self._last_emit = now
-        emit(self._bridge.progress, done, total, note)
+        emit(self._bridge.progress, self._token, done, total, note)
 
     def check_cancel(self):
         if self._cancel.is_set():
             raise Cancelled()
 
 
+@dataclass
+class _Request:
+    token: int
+    kind: str
+    spec: object
+    params: dict
+    session: dict
+
+
+@dataclass
+class _Job:
+    request: _Request
+    cancel: threading.Event
+    thread: object = None
+
+    @property
+    def token(self):
+        return self.request.token
+
+    @property
+    def kind(self):
+        return self.request.kind
+
+
 class JobRunner:
     def __init__(self, bridge):
         self.bridge = bridge
-        self._thread = None
-        self._cancel = threading.Event()
-        self._preview_gen = 0
-        self._job = 0
+        self._active = None
+        self._pending = None
+        self._next_token = 0
+        self._current_token = 0
+        self._closing = False
+        bridge.job_exited.connect(self._on_job_exited)
 
     @property
     def busy(self):
-        return self._thread is not None and self._thread.is_alive()
+        return self._active is not None or self._pending is not None
+
+    @property
+    def kind(self):
+        if self._pending is not None:
+            return self._pending.kind
+        return self._active.kind if self._active is not None else ''
+
+    def is_current(self, token):
+        return token != 0 and token == self._current_token
 
     def cancel(self):
-        self._cancel.set()
+        pending = self._pending
+        if pending is not None and pending.kind == 'run':
+            self._pending = None
+            if self._active is not None:
+                self._current_token = self._active.token
+            else:
+                self._current_token = 0
+            emit(self.bridge.run_cancelled, pending.token, None)
+        if self._active is not None:
+            self._active.cancel.set()
 
     def stop(self):
-        """关窗时调用：先把在跑的活停掉，别让它在窗口析构后还往 Bridge 发信号
-        （超时溜过去的那种由上面的 emit 兜住）。"""
-        self._stop_current()
-
-    def _stop_current(self, timeout=JOIN_TIMEOUT):
-        """取消在跑的活并等它退出。工具在循环里 check_cancel，退出很快。"""
-        if self.busy:
-            self._cancel.set()
-            self._thread.join(timeout)
-        self._cancel = threading.Event()
-        self._thread = None
-        # 上一份活从此说什么都不算——它可能还卡在 socket 上没醒。
-        self._job += 1
-
-    def _context(self, session, job):
-        return GuiContext(self.bridge, self._cancel, session,
-                          alive=lambda: self._job == job)
-
-    def _emit(self, job, signal, *args):
-        if job == self._job:
-            emit(signal, *args)
-
-    def _spawn(self, target):
-        self._thread = threading.Thread(target=target, daemon=True)
-        self._thread.start()
+        self._closing = True
+        self._pending = None
+        self._current_token = 0
+        if self._active is not None:
+            self._active.cancel.set()
+        else:
+            emit(self.bridge.idle)
 
     def request_preview(self, spec, params, session):
-        self._stop_current()
-        self._preview_gen += 1
-        gen = self._preview_gen
-        job = self._job
-        ctx = self._context(session, job)
-
-        def run_preview():
-            try:
-                result = spec.preview(params, ctx)
-            except Cancelled:
-                return
-            except Exception as e:
-                self._emit(job, self.bridge.preview_failed, gen,
-                           '%s: %s' % (type(e).__name__, e))
-                return
-            self._emit(job, self.bridge.preview_ready, gen, result)
-
-        self._spawn(run_preview)
-        return gen
-
-    def is_current_preview(self, gen):
-        return gen == self._preview_gen
+        return self._submit('preview', spec, params, session)
 
     def start_run(self, spec, params, session):
-        self._stop_current()
-        job = self._job
-        ctx = self._context(session, job)
+        return self._submit('run', spec, params, session)
 
-        def do_run():
-            try:
-                result = spec.run(params, ctx)
-            except Cancelled as c:
-                self._emit(job, self.bridge.run_cancelled,
-                           getattr(c, 'partial', None))
-                return
-            except Exception:
-                self._emit(job, self.bridge.run_failed, traceback.format_exc())
-                return
-            self._emit(job, self.bridge.run_finished, result)
+    def _new_request(self, kind, spec, params, session):
+        self._next_token += 1
+        return _Request(self._next_token, kind, spec, params, session)
 
-        self._spawn(do_run)
+    def _submit(self, kind, spec, params, session):
+        if self._closing:
+            return 0
+        request = self._new_request(kind, spec, params, session)
+        if self._active is not None:
+            if self._pending is not None and self._pending.kind == 'run' and kind == 'preview':
+                return self._pending.token
+            self._pending = request
+            self._current_token = request.token
+            self._active.cancel.set()
+            return request.token
+        self._current_token = request.token
+        self._start(request)
+        return request.token
+
+    def _start(self, request):
+        job = _Job(request, threading.Event())
+        self._active = job
+        ctx = GuiContext(self.bridge, request.token, job.cancel, request.session)
+
+        def work():
+            if request.kind == 'preview':
+                self._run_preview(request, ctx)
+            else:
+                self._run_tool(request, ctx)
+
+        def reap():
+            job.thread.join()
+            emit(self.bridge.job_exited, request.token)
+
+        job.thread = threading.Thread(target=work, daemon=True)
+        job.thread.start()
+        threading.Thread(target=reap, daemon=True).start()
+
+    def _run_preview(self, request, ctx):
+        try:
+            result = request.spec.preview(request.params, ctx)
+        except Cancelled:
+            return
+        except Exception as e:
+            emit(self.bridge.preview_failed, request.token,
+                 '%s: %s' % (type(e).__name__, e))
+            return
+        emit(self.bridge.preview_ready, request.token, result)
+
+    def _run_tool(self, request, ctx):
+        try:
+            result = request.spec.run(request.params, ctx)
+        except Cancelled as stop:
+            emit(self.bridge.run_cancelled, request.token,
+                 getattr(stop, 'partial', None))
+            return
+        except Exception:
+            emit(self.bridge.run_failed, request.token, traceback.format_exc())
+            return
+        emit(self.bridge.run_finished, request.token, result)
+
+    def _on_job_exited(self, token):
+        if self._active is None or self._active.token != token:
+            return
+        self._active = None
+        if self._closing:
+            emit(self.bridge.idle)
+            return
+        if self._pending is None:
+            if self._current_token == token:
+                self._current_token = 0
+            emit(self.bridge.idle)
+            return
+        request, self._pending = self._pending, None
+        self._start(request)

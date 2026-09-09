@@ -124,7 +124,7 @@ for row in table_rows(page):
 print('ID 格链接 =', page.table.item(0, 2).data(Qt.UserRole))
 
 done = []
-win.bridge.run_finished.connect(done.append)
+win.bridge.run_finished.connect(lambda _token, result: done.append(result))
 page.start_btn.click()
 pump(until=lambda: done)
 if not done:

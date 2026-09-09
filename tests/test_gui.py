@@ -19,7 +19,7 @@ import pytest
 pytest.importorskip('PySide6')
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from PySide6.QtCore import QSettings, Qt                       # noqa: E402
+from PySide6.QtCore import QEventLoop, QSettings, Qt               # noqa: E402
 from PySide6.QtWidgets import QApplication                     # noqa: E402
 
 from galtools.core.context import Cancelled                    # noqa: E402
@@ -44,44 +44,95 @@ def window(monkeypatch, tmp_path):
     return mw.MainWindow()
 
 
+def wait_until(qt_app, predicate, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qt_app.processEvents(QEventLoop.AllEvents, 20)
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
 def spec_with(run):
     return ToolSpec(id='fake', name='假工具', category='测试',
                     description='只为驱动 JobRunner',
                     fields=(Field(key='x', kind=TEXT, label='x'),), run=run)
 
 
-def test_an_abandoned_job_stops_being_heard(qt_app):
-    """新活开跑前先取消旧活，但只 join 一秒——真卡在 socket 上的旧线程能活过这次
-    等待。它后来发的日志、进度、结果必须一律丢弃，否则上一轮的东西会插进下一轮。"""
+def preview_spec(preview):
+    return ToolSpec(id='preview', name='假预览', category='测试',
+                    description='只为驱动 JobRunner',
+                    fields=(Field(key='x', kind=TEXT, label='x'),),
+                    run=lambda _params, _ctx: RunResult(), preview=preview)
+
+
+def test_superseded_queued_events_are_ignored(qt_app):
     bridge = Bridge()
-    logs, steps = [], []
-    bridge.log.connect(lambda msg, level: logs.append(msg), Qt.DirectConnection)
-    bridge.progress.connect(lambda *a: steps.append(a), Qt.DirectConnection)
     runner = JobRunner(bridge)
+    release = threading.Event()
+    started = threading.Event()
+    seen = []
+    bridge.log.connect(
+        lambda token, msg, _level: seen.append((token, msg))
+        if runner.is_current(token) else None)
 
-    job = runner._job
-    ctx = runner._context({}, job)
-    ctx.log('还在的时候说的话')
-    ctx.progress(1, 2, '还在的时候的进度')
-    assert logs == ['还在的时候说的话'] and len(steps) == 1
+    def old_preview(_params, ctx):
+        ctx.log('旧日志')
+        started.set()
+        release.wait(5)
+        return PreviewResult(summary='旧结果')
 
-    runner._stop_current()                  # 换代：这份活从此说什么都不算
-    ctx.log('过期之后说的话')
-    ctx.progress(2, 2, '过期之后的进度')
-    runner._emit(job, bridge.log, '过期之后发的信号', 'info')
-    assert logs == ['还在的时候说的话'] and len(steps) == 1
+    old_token = runner.request_preview(preview_spec(old_preview), {}, {})
+    assert started.wait(5)
+    new_token = runner.request_preview(
+        preview_spec(lambda _params, _ctx: PreviewResult(summary='新结果')), {}, {})
+    assert new_token != old_token
+    release.set()
+    assert wait_until(qt_app, lambda: not runner.busy)
+    assert not runner.is_current(old_token)
+    assert all(token != old_token for token, _msg in seen)
+
+
+def test_jobs_are_serialized_and_pending_run_can_be_cancelled(qt_app):
+    bridge = Bridge()
+    runner = JobRunner(bridge)
+    preview_started = threading.Event()
+    preview_release = threading.Event()
+    run_started = threading.Event()
+    cancelled = []
+    bridge.run_cancelled.connect(
+        lambda token, partial: cancelled.append((token, partial)), Qt.DirectConnection)
+
+    def slow_preview(_params, _ctx):
+        preview_started.set()
+        preview_release.wait(5)
+        return PreviewResult()
+
+    def run(_params, _ctx):
+        run_started.set()
+        return RunResult()
+
+    runner.request_preview(preview_spec(slow_preview), {}, {})
+    assert preview_started.wait(5)
+    run_token = runner.start_run(spec_with(run), {}, {})
+    assert runner.kind == 'run'
+    runner.cancel()
+    preview_release.set()
+    assert wait_until(qt_app, lambda: not runner.busy)
+    assert not run_started.is_set()
+    assert [token for token, _partial in cancelled] == [run_token]
 
 
 def test_cancelling_a_run_reports_the_partial_result(qt_app):
-    """取消要能把「已经做了多少」带回来：Cancelled 上挂的 partial 是工具唯一的
-    汇报渠道，run_cancelled 丢了它，用户就只看到一句「已取消」。"""
     bridge = Bridge()
     got = []
-    bridge.run_cancelled.connect(got.append, Qt.DirectConnection)
+    bridge.run_cancelled.connect(
+        lambda _token, partial: got.append(partial), Qt.DirectConnection)
     runner = JobRunner(bridge)
     running = threading.Event()
 
-    def slow(params, ctx):
+    def slow(_params, ctx):
         running.set()
         try:
             while True:
@@ -94,9 +145,8 @@ def test_cancelling_a_run_reports_the_partial_result(qt_app):
     runner.start_run(spec_with(slow), {}, {})
     assert running.wait(5)
     runner.cancel()
-    runner._thread.join(5)
-    assert not runner.busy
-    assert [r.summary for r in got] == ['已经做了一半']
+    assert wait_until(qt_app, lambda: not runner.busy)
+    assert [result.summary for result in got] == ['已经做了一半']
 
 
 def test_a_failed_preview_puts_the_progress_bar_back(qt_app, monkeypatch,
@@ -106,10 +156,12 @@ def test_a_failed_preview_puts_the_progress_bar_back(qt_app, monkeypatch,
     win = window(monkeypatch, tmp_path)
     try:
         page = win.pages['vndb_voiced']
-        win._preview_page = page
+        token = 17
+        monkeypatch.setattr(win.runner, 'is_current', lambda got: got == token)
+        win._preview_requests[token] = (page, page.form.values())
         win.progress.setMaximum(0)          # 预览把它切成了无限滚动
         win.status.setText('正在查 vndb…')
-        win._on_preview_failed(win.runner._preview_gen, 'boom')
+        win._on_preview_failed(token, 'boom')
         assert win.progress.maximum() == 100
         assert win.status.text() == '预览失败'
         assert page.preview_ok is False
@@ -129,15 +181,15 @@ def test_starting_a_run_takes_over_the_progress_bar(qt_app, monkeypatch,
         page.form._editors['src_dir'].setCurrentText(str(tmp_path))
         assert page.validation_errors() == {}          # 证明起跑不会被校验拦下
         monkeypatch.setattr(win.runner, 'start_run',
-                            lambda *a, **k: None)      # 不真起线程
+                            lambda *a, **k: 23)       # 不真起线程
 
-        win._on_progress(0, 0, '正在查…')               # 预览留下的无限滚动
+        win.progress.setMaximum(0)                  # 预览留下的无限滚动
         assert win.progress.maximum() == 0
 
         win._start_run(page)
         assert win.progress.maximum() == 100
 
-        win._on_run_cancelled(None)
+        win._on_run_cancelled(23, None)
         assert win.progress.maximum() == 100
         assert win.status.text() == '已取消'
     finally:
@@ -156,11 +208,13 @@ def test_a_successful_preview_remembers_the_directory(qt_app, monkeypatch,
         page.form._editors['db_dir'].setCurrentText(str(db))
         page.form._editors['who'].setCurrentText('s1')
         assert page.validation_errors() == {}     # 证明预览不会被校验拦下
+        token = 29
         monkeypatch.setattr(win.runner, 'request_preview',
-                            lambda *a, **k: None)  # 不真起线程
+                            lambda *a, **k: token)     # 不真起线程
+        monkeypatch.setattr(win.runner, 'is_current', lambda got: got == token)
+        win._active_page = page
         win._request_preview(page)
-        win._on_preview_ready(win.runner._preview_gen,
-                              PreviewResult(summary='只看不导', ok=False))
+        win._on_preview_ready(token, PreviewResult(summary='只看不导', ok=False))
     finally:
         win.close()
 
@@ -211,6 +265,55 @@ def test_a_directory_that_does_not_exist_is_not_remembered(qt_app, monkeypatch,
         win.close()
 
 
+def test_update_all_does_not_require_staff_in_the_gui(qt_app, monkeypatch, tmp_path):
+    win = window(monkeypatch, tmp_path)
+    try:
+        page = win.pages['vndb_voiced']
+        page.form._editors['update_all'].setChecked(True)
+        page.form._editors['db_dir'].setCurrentText(str(tmp_path))
+        assert page.form.missing_required_keys() == []
+        assert page.validation_errors() == {}
+    finally:
+        win.close()
+
+
+def test_hidden_page_cannot_request_a_preview(qt_app, monkeypatch, tmp_path):
+    win = window(monkeypatch, tmp_path)
+    try:
+        hidden = win.pages['seiyuu_db']
+        active = win.pages['mjo_text']
+        win._active_page = active
+        calls = []
+        monkeypatch.setattr(win.runner, 'request_preview',
+                            lambda *args: calls.append(args))
+        win._request_preview(hidden)
+        assert calls == []
+    finally:
+        win.close()
+
+
+def test_cancelled_result_keeps_outputs_and_diagnostics(qt_app, monkeypatch,
+                                                         tmp_path):
+    win = window(monkeypatch, tmp_path)
+    try:
+        page = win.pages['mjo_text']
+        page.set_busy(True)
+        win._active_page = page
+        win._run_token = 41
+        output = tmp_path / 'partial'
+        output.mkdir()
+        partial = RunResult(summary='完成一半', output_paths=[str(output)],
+                            warnings=['注意'], failures=[('x', '失败')])
+        win._on_run_cancelled(41, partial)
+        assert win.status.text() == '已取消'
+        assert win.open_btn.isEnabled()
+        text = win.log.toPlainText()
+        assert '完成一半' in text and '注意' in text and '失败' in text
+    finally:
+        win.close()
+
+
+# ---------------- 路径 ----------------
 def test_a_drive_root_keeps_its_separator():
     """`E:` 指的是 E 盘的当前工作目录而不是根目录，isdir 却照样为真：选了盘根做
     输出目录，文件会静默落到进程的 cwd 里。"""

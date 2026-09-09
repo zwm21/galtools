@@ -1083,6 +1083,7 @@ def test_build_without_ctx_writes_everything(tmp_path):
 # ---------------- 工具层 ----------------
 def test_validate_is_offline_and_reports_first_bad_target(tmp_path):
     assert tool.validate(args('s1', tmp_path)) == []
+    assert dict(tool.validate(args('', tmp_path)))['staff'] == '要填一个声优目标'
     errors = dict(tool.validate(args('v3, c9', tmp_path / '没有这个目录')))
     assert '目录不存在' in errors['out_dir']
     assert '作品' in errors['staff']          # 只报第一个坏目标
@@ -1399,9 +1400,8 @@ def test_tool_spec_fields_match_what_run_reads():
     # 更新全库是贵操作：勾选只标记过期，等用户点「查询」，不能勾一下就自动开打。
     assert [f.key for f in tool.TOOL.fields if f.rescan] == ['staff', 'refresh',
                                                              'update_all']
-    # 两个目录都是条件必填，写成 required=True 会让 ToolPage 在 validate 之前
-    # 就报「必填」，连预览都发不出去。
-    assert [f.key for f in tool.TOOL.fields if f.required] == ['staff']
+    # staff 与两个目录都是条件必填，统一交给 validate，避免 update-all 被静态必填拦住。
+    assert [f.key for f in tool.TOOL.fields if f.required] == []
     assert dict((f.key, f.default) for f in tool.TOOL.fields
                 if f.kind == 'bool') == {'save_db': True, 'export': False,
                                          'refresh': False, 'update_all': False}

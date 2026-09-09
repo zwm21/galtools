@@ -135,7 +135,9 @@ def validate(params):
             errors.append((key, '勾了「%s」就要填这里' % label))
     raw = (params.get('staff') or '').strip()
     targets = fetch.parse_targets(raw)
-    if raw and not targets:
+    if not raw:
+        errors.append(('staff', '要填一个声优目标'))
+    elif not targets:
         errors.append(('staff', '没解析出任何目标'))
     if len(targets) > MAX_TARGETS:
         errors.append(('staff', too_many_people(len(targets))))
@@ -520,6 +522,7 @@ TOOL = ToolSpec(
                 '都重抓一遍，有变化才覆盖。',
     fields=(
         Field(key='staff', kind=TEXT, label='声优', rescan=True, history=True,
+              required=False,
               help='id（s367）、声优页网址或名字，多个用逗号分隔，最多 8 个人。'
                    '名字有歧义时会列出候选，改填其中的 id 即可。',
               placeholder='s367, s131'),
