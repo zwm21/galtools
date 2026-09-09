@@ -2,4 +2,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 AGENTS.md
+/tests/manual/live_db/
 docs/
