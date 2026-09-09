@@ -70,6 +70,32 @@ def test_diff_credits_separates_added_removed_and_edits():
     assert [c.cid for c in removed] == ['c1']
 
 
+def test_diff_credits_counts_duplicate_identities():
+    one = make_credit(cid='c1')
+    old = [one, make_credit(cid='c1'), make_credit(cid='c2')]
+    new = [make_credit(cid='c1'), make_credit(cid='c3')]
+    added, removed = update.diff_credits(old, new)
+    assert [credit.cid for credit in added] == ['c3']
+    assert [credit.cid for credit in removed] == ['c1', 'c2']
+
+    added, removed = update.diff_credits([one], [one, make_credit(cid='c1')])
+    assert [credit.cid for credit in added] == ['c1']
+    assert removed == []
+
+
+def test_build_entries_distinguishes_empty_transitions():
+    empty = make_person(credits=[])
+    same = update.build_entries([empty], {'s1': make_fresh(credits=[])}, {})[0]
+    renamed = update.build_entries(
+        [empty], {'s1': make_fresh(name='Renamed', credits=[])}, {})[0]
+    filled = update.build_entries(
+        [empty], {'s1': make_fresh(credits=[make_credit()])}, {})[0]
+    emptied = update.build_entries(
+        [make_person(credits=[make_credit()])], {'s1': make_fresh(credits=[])}, {})[0]
+    assert [same.status, renamed.status, filled.status, emptied.status] == [
+        update.SAME, update.CHANGED, update.CHANGED, update.EMPTY]
+
+
 def test_build_entries_covers_all_four_statuses_in_roster_order():
     people = [make_person(sid='s1', credits=[make_credit()]),
               make_person(sid='s2', credits=[make_credit()]),

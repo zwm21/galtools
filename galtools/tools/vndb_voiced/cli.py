@@ -136,7 +136,11 @@ def main():
         ap.error(error)
     ctx = ConsoleContext()
     result = run(params, ctx)
-    print(result.summary)
+    print(result.summary, flush=True)
+    for warning in result.warnings:
+        print('[!] %s' % warning, file=sys.stderr)
+    for name, reason in result.failures:
+        print('[!] %s: %s' % (name, reason), file=sys.stderr)
     # 一个文件都没写出来时以非零退出。ApiError 那条路径本来就这样，而「目标全都
     # 定位不到人」「输出目录不可用」同样是什么都没产出，exit 0 会让调用它的脚本
     # 把这些当成成功。

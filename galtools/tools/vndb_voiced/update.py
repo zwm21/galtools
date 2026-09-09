@@ -4,6 +4,7 @@
 纯逻辑，不 import 网络：抓取与读库在 tool.py 里汇合，这里只负责「谁变了、
 变了什么、表格怎么摆」，整个模块都能离线测试。
 """
+from collections import Counter
 from dataclasses import dataclass, field
 
 from ...core.spec import Table
@@ -58,12 +59,22 @@ def same_item(old, new):
 
 
 def diff_credits(old, new):
-    """(新增, 移除)：按身份键做集合差，各自保持在原列表里的顺序。"""
-    old_keys = {credit_key(c) for c in old}
-    new_keys = {credit_key(c) for c in new}
-    added = [c for c in new if credit_key(c) not in old_keys]
-    removed = [c for c in old if credit_key(c) not in new_keys]
-    return added, removed
+    """(新增, 移除)：按身份键做多重集合差，各自保持在原列表里的顺序。"""
+    old_counts = Counter(credit_key(c) for c in old)
+    new_counts = Counter(credit_key(c) for c in new)
+    add_counts = new_counts - old_counts
+    remove_counts = old_counts - new_counts
+
+    def consume(credits, counts):
+        out = []
+        for credit in credits:
+            key = credit_key(credit)
+            if counts[key] > 0:
+                out.append(credit)
+                counts[key] -= 1
+        return out
+
+    return consume(new, add_counts), consume(old, remove_counts)
 
 
 def build_entries(people, fresh, errors):
@@ -84,7 +95,7 @@ def build_entries(people, fresh, errors):
             entries.append(Entry(person=person, status=FAILED,
                                  error='没有抓取结果'))
             continue
-        if not item.credits:
+        if person.item.credits and not item.credits:
             entries.append(Entry(person=person, fresh=item, status=EMPTY))
             continue
         if same_item(person.item, item):

@@ -5,6 +5,7 @@
 _sleep 顺带推进一个假时钟——限流是按 time.monotonic 做的滑动窗口，假睡眠不推
 时钟的话窗口永远滚不过去，会死循环。
 """
+import http.client
 import io
 import json
 import os
@@ -283,6 +284,73 @@ def test_cancel_while_reading_body(monkeypatch):
     assert len(fake.calls) == 1      # 发出去了，读的时候才取消
 
 
+class ScriptedResponse(FakeResponse):
+    def __init__(self, *steps):
+        super().__init__(b'')
+        self.steps = list(steps)
+
+    def read(self, size=-1):
+        if not self.steps:
+            return b''
+        step = self.steps.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+def test_body_read_error_is_retried_and_every_response_is_closed(monkeypatch):
+    responses = [ScriptedResponse(OSError('reset')),
+                 ScriptedResponse(json.dumps(page([{'id': 'v1'}])).encode(), b'')]
+    calls = []
+
+    def open_response(_req, _timeout):
+        calls.append(True)
+        return responses[len(calls) - 1]
+
+    clock = FakeClock()
+    monkeypatch.setattr(api, '_open', open_response)
+    monkeypatch.setattr(api, '_sleep', lambda seconds: setattr(
+        clock, 'now', clock.now + seconds))
+    monkeypatch.setattr(api, 'time', clock)
+    assert api.Client().post('vn', {})['results'] == [{'id': 'v1'}]
+    assert len(calls) == 2
+    assert all(response.closed for response in responses)
+
+
+@pytest.mark.parametrize('error', [
+    OSError('reset'), http.client.IncompleteRead(b'half', 10),
+])
+def test_body_read_error_gives_up_after_max_attempts(monkeypatch, error):
+    responses = []
+
+    def open_response(_req, _timeout):
+        response = ScriptedResponse(error)
+        responses.append(response)
+        return response
+
+    clock = FakeClock()
+    monkeypatch.setattr(api, '_open', open_response)
+    monkeypatch.setattr(api, '_sleep', lambda seconds: setattr(
+        clock, 'now', clock.now + seconds))
+    monkeypatch.setattr(api, 'time', clock)
+    with pytest.raises(api.ApiError) as caught:
+        api.Client().post('vn', {})
+    assert len(responses) == api.MAX_ATTEMPTS
+    assert all(response.closed for response in responses)
+    assert '读取' in str(caught.value)
+
+
+def test_cancel_during_body_read_is_not_retried(monkeypatch):
+    response = ScriptedResponse(b'{}', b'')
+    calls = []
+    monkeypatch.setattr(api, '_open',
+                        lambda _req, _timeout: calls.append(True) or response)
+    with pytest.raises(Cancelled):
+        api.Client(CountingCtx(2)).post('vn', {})
+    assert calls == [True]
+    assert response.closed
+
+
 def test_throttle_waits_for_window_to_slide(monkeypatch):
     fake = FakeApi(lambda p, b, n: page([])).install(monkeypatch)
     client = api.Client(quota=2)
@@ -471,6 +539,60 @@ def test_resolve_name_takes_the_only_exact_match(monkeypatch):
     FakeApi(vndb()).install(monkeypatch)
     res = fetch.resolve_target('Alpha One', api.Client())
     assert res.ok and res.staff.sid == 's1'
+
+
+def test_resolve_name_finds_an_exact_match_on_the_second_page(monkeypatch):
+    first = {'id': 's2', 'aid': 'a8', 'name': 'Target Fake', 'original': ''}
+    exact = {'id': 's1', 'aid': 'a1', 'name': 'Target Name', 'original': '',
+             'ismain': True}
+
+    def handler(path, body, _nth):
+        if body.get('filters') == ['search', '=', 'Target Name']:
+            return page([first], more=True) if body['page'] == 1 else page([exact])
+        return page(STAFF_ROWS.get('s1', []))
+
+    FakeApi(handler).install(monkeypatch)
+    result = fetch.resolve_name('Target Name', api.Client())
+    assert result.ok and result.staff.sid == 's1'
+
+
+def test_resolve_name_refuses_exact_matches_across_pages(monkeypatch):
+    rows = [
+        {'id': 's1', 'aid': 'a1', 'name': 'Same Name', 'original': ''},
+        {'id': 's2', 'aid': 'a9', 'name': 'Same Name', 'original': ''},
+    ]
+
+    def handler(path, body, _nth):
+        filters = body.get('filters')
+        if filters == ['search', '=', 'Same Name']:
+            return page([rows[body['page'] - 1]], more=body['page'] == 1)
+        if filters and filters[0] == 'or':
+            return page([STAFF_ROWS[sid][0] for sid in ('s1', 's2')])
+        raise AssertionError((path, body))
+
+    FakeApi(handler).install(monkeypatch)
+    result = fetch.resolve_name('Same Name', api.Client())
+    assert not result.ok and '命中 2 个人' in result.error
+    assert [candidate.sid for candidate in result.candidates] == ['s1', 's2']
+
+
+def test_resolve_name_deduplicates_sids_across_pages(monkeypatch):
+    duplicate = {'id': 's1', 'aid': 'a2', 'name': 'Different', 'original': ''}
+    other = {'id': 's2', 'aid': 'a8', 'name': 'Another', 'original': ''}
+
+    def handler(path, body, _nth):
+        filters = body.get('filters')
+        if filters == ['search', '=', 'Needle']:
+            if body['page'] == 1:
+                return page([duplicate], more=True)
+            return page([duplicate, other])
+        if filters and filters[0] == 'or':
+            return page([STAFF_ROWS[sid][0] for sid in ('s1', 's2')])
+        raise AssertionError((path, body))
+
+    FakeApi(handler).install(monkeypatch)
+    result = fetch.resolve_name('Needle', api.Client())
+    assert [candidate.sid for candidate in result.candidates] == ['s1', 's2']
 
 
 def test_resolve_name_refuses_when_ambiguous(monkeypatch):
@@ -1645,6 +1767,25 @@ def test_cli_exit_code_says_whether_anything_was_written(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, 'run', lambda params, ctx: RunResult(
         summary='好了', output_paths=[str(tmp_path / 'x.xlsx')]))
     assert cli.main() == 0
+
+
+def test_cli_prints_complete_diagnostics_without_changing_exit_codes(
+        monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli.sys, 'argv', ['cli', 's1', '-o', str(tmp_path)])
+    monkeypatch.setattr(cli, 'run', lambda params, ctx: RunResult(
+        summary='部分完成', output_paths=[str(tmp_path / 'x.xlsx')],
+        warnings=['警告甲'], failures=[('s2', '失败乙')]))
+    assert cli.main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == '部分完成\n'
+    assert captured.err.splitlines() == ['[!] 警告甲', '[!] s2: 失败乙']
+
+    monkeypatch.setattr(cli, 'run', lambda params, ctx: RunResult(
+        summary='全部失败', warnings=['警告丙'], failures=[('s1', '失败丁')]))
+    assert cli.main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == '全部失败\n'
+    assert captured.err.splitlines() == ['[!] 警告丙', '[!] s1: 失败丁']
 
 
 def test_cli_defaults_to_exporting_and_only_saves_when_told(monkeypatch,

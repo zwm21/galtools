@@ -30,8 +30,6 @@ CHAR_FIELDS = 'id,name,original,vns.id,vns.role'
 VN_FIELDS = ('id,title,alttitle,released,'
              'va.staff.id,va.staff.aid,va.character.id,va.note')
 
-SEARCH_LIMIT = 20
-
 # 目标之间的分隔符。刻意不含空格：罗马字人名自带空格（Ono Ryouko），
 # 拿空格当分隔符会把一个人切成两个不存在的目标。
 SPLIT_RE = re.compile(r'[,，、;；\n\r\t]+')
@@ -170,9 +168,9 @@ def resolve_name(target, client):
     选错人，所以规则写死成：按 id 去重 → 归一化后与 name/original 精确相等的
     唯一候选才自动采用 → 否则列出全部候选（展示各 id 的主名）并拒绝启动。
     """
-    res = client.post('staff', {'filters': ['search', '=', target],
-                                'fields': STAFF_FIELDS, 'results': SEARCH_LIMIT})
-    rows = res.get('results') or []
+    rows = list(client.paged('staff', {
+        'filters': ['search', '=', target], 'fields': STAFF_FIELDS,
+    }))
     if not rows:
         return Resolution(target=target, error='搜不到叫「%s」的人' % target)
 

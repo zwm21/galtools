@@ -15,6 +15,7 @@
 吞掉；取消的粒度是「当前这一个请求」（实测单次 0.6–3 秒）。真卡在 socket 上时
 GUI 那边不靠等待它退出来保证正确性，见 gui/worker.py 顶上的说明。
 """
+import http.client
 import json
 import threading
 import time
@@ -194,6 +195,8 @@ class Client:
             raise _Retry('与 api.vndb.org 的连接中断（%s）' % e)
         try:
             raw = _read(resp, self._ctx)
+        except (OSError, http.client.HTTPException) as e:
+            raise _Retry('读取 api.vndb.org 响应时连接中断（%s）' % e)
         finally:
             resp.close()
         try:
