@@ -10,7 +10,7 @@ import threading
 
 import pytest
 
-from galtools.core.context import RunContext
+from galtools.core.context import Cancelled, RunContext
 from galtools.tools import seiyuu_db as tool
 from galtools.tools.vndb_voiced import store, xlsx
 from galtools.tools.vndb_voiced.model import Credit, Staff, StaffCredits
@@ -525,6 +525,23 @@ def test_run_reports_a_write_failure_instead_of_a_traceback(tmp_path,
     assert result.output_paths == []
     assert dict(result.failures)['写 Excel'] == '盘满了'
     assert '盘满了' in result.summary
+
+
+def test_offline_cancel_before_xlsx_publish_has_accurate_partial(
+        tmp_path, monkeypatch):
+    out = tmp_path / 'out'
+    out.mkdir()
+
+    def cancel_save(*_args, **_kwargs):
+        raise Cancelled()
+
+    monkeypatch.setattr(tool.xlsx, 'save', cancel_save)
+    with pytest.raises(Cancelled) as caught:
+        tool.run(args(trio(tmp_path), out_dir=str(out)), RunContext())
+    partial = caught.value.partial
+    assert partial.output_paths == []
+    assert partial.table is not None
+    assert list(out.iterdir()) == []
 
 
 def test_a_broken_file_is_reported_but_still_exports(tmp_path):

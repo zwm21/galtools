@@ -1191,6 +1191,56 @@ def test_save_accepts_an_explicit_xlsx_path(tmp_path):
     assert path == str(target) and os.path.exists(path)
 
 
+def test_save_treats_an_existing_xlsx_named_directory_as_a_directory(tmp_path):
+    pytest.importorskip('openpyxl')
+    target = tmp_path / 'folder.xlsx'
+    target.mkdir()
+    path = xlsx.save([person('s1', [])], [], str(target))
+    assert os.path.dirname(path) == str(target)
+    assert os.path.basename(path) == 'vndb_S1_voiced.xlsx'
+    assert xlsx.target_dir(str(target)) == str(target)
+
+
+def test_save_is_atomic_on_failure_and_cleans_its_temporary_file(
+        tmp_path, monkeypatch):
+    pytest.importorskip('openpyxl')
+    target = tmp_path / 'out.xlsx'
+    target.write_bytes(b'old')
+
+    def broken_build(_items, _combos, path, ctx=None):
+        with open(path, 'wb') as stream:
+            stream.write(b'partial')
+        raise OSError('盘满了')
+
+    monkeypatch.setattr(xlsx, 'build', broken_build)
+    with pytest.raises(OSError):
+        xlsx.save([person('s1', [])], [], str(target))
+    assert target.read_bytes() == b'old'
+    assert os.listdir(str(tmp_path)) == ['out.xlsx']
+
+
+def test_save_checks_cancel_before_publishing(tmp_path, monkeypatch):
+    pytest.importorskip('openpyxl')
+    built = []
+
+    def fake_build(_items, _combos, path, ctx=None):
+        with open(path, 'wb') as stream:
+            stream.write(b'complete')
+        built.append(path)
+        return path
+
+    class CancelBeforeReplace:
+        def check_cancel(self):
+            raise Cancelled()
+
+    monkeypatch.setattr(xlsx, 'build', fake_build)
+    target = tmp_path / 'out.xlsx'
+    with pytest.raises(Cancelled):
+        xlsx.save([person('s1', [])], [], str(target), ctx=CancelBeforeReplace())
+    assert built and not target.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_target_dir_agrees_with_where_save_writes(tmp_path):
     """工具层靠 target_dir 在抓取之前先建目录，它算出的必须与 save 真正写入的
     目录一致——两处各写一份判断就会挡下一个地方、写进另一个地方。"""
@@ -1427,6 +1477,25 @@ def test_run_refuses_a_bad_output_dir_before_spending_a_request(monkeypatch,
     assert result.output_paths == []
     assert [name for name, _ in result.failures] == ['导出目录']
     assert fake.calls == []                        # 一个请求都没打出去
+
+
+def test_online_cancel_during_xlsx_keeps_published_db_in_partial(
+        monkeypatch, tmp_path):
+    FakeApi(vndb()).install(monkeypatch)
+    db = tmp_path / 'db'
+    out = tmp_path / 'out'
+    db.mkdir()
+    out.mkdir()
+
+    def cancel_save(*_args, **_kwargs):
+        raise Cancelled()
+
+    monkeypatch.setattr(xlsx, 'save', cancel_save)
+    with pytest.raises(Cancelled) as caught:
+        tool.run(args('s1', out, save_db=True, db_dir=str(db)), RunContext())
+    assert caught.value.partial.output_paths == [str(db)]
+    assert os.listdir(str(db)) == ['s1.json']
+    assert list(out.iterdir()) == []
 
 
 def test_run_takes_back_the_directory_it_made_when_it_wrote_nothing(monkeypatch,

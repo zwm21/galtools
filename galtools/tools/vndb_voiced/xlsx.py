@@ -10,6 +10,7 @@ ref 至少含一行数据，只有表头的 ref 会让文件被判定为损坏�
 """
 import os
 import re
+import tempfile
 from ...core.paths import keep_drive_root
 from .model import ROLES, role_counts, url_for
 
@@ -306,22 +307,17 @@ def _combo_index(wb, items, planned, title, tname, font):
 
 
 # ---------------- 入口 ----------------
-def target_dir(target):
-    """save 会把工作簿写进哪个目录。
-
-    工具层在**抓取之前**拿它先建一次目录：抓完几分钟才发现盘不存在，那几分钟
-    就白等了。save 也调它算目录，所以先挡下的地方和真正写入的地方一定是同一个。
-
-    名字以 .xlsx 结尾的**目录**会被当成文件路径，工作簿落到它的父目录而不是它
-    里面（带不带尾分隔符只影响文件名：不带就沿用 foo.xlsx，带了就退回
-    workbook_name）。既有行为，这里只记着。
-
-    abspath 之前先补盘符：`-o E:` 的 abspath 是 E 盘的当前工作目录而不是根目录。
-    """
+def resolve_target(target, default_name):
+    """把目录或显式 .xlsx 解析成 (目录, 文件名)，现存目录优先。"""
     target = os.path.abspath(keep_drive_root(target or '.'))
-    if target.lower().endswith('.xlsx'):
-        return os.path.dirname(target) or '.'
-    return target
+    if not os.path.isdir(target) and target.lower().endswith('.xlsx'):
+        return os.path.dirname(target) or '.', os.path.basename(target)
+    return target, default_name
+
+
+def target_dir(target):
+    """save 会把工作簿写进哪个目录，供调用方在耗时操作前预检。"""
+    return resolve_target(target, '')[0]
 
 
 def build(items, combos, path, ctx=None):
@@ -383,13 +379,24 @@ def build(items, combos, path, ctx=None):
     return path
 
 
-def save(items, combos, target, ctx=None):
-    """target 可以是目录也可以是 .xlsx 路径。返回实际写入的路径。"""
-    directory = target_dir(target)
-    if (target or '').lower().endswith('.xlsx'):
-        name = os.path.basename(target)
-    else:
-        name = workbook_name([i.staff for i in items])
+def save(items, combos, target, ctx=None, name=None):
+    """原子写出工作簿；target 可为目录或显式 .xlsx 路径。"""
+    default_name = name or workbook_name([i.staff for i in items])
+    directory, filename = resolve_target(target, default_name)
     os.makedirs(directory, exist_ok=True)
-    return build(items, combos, unique_path(os.path.join(directory, name)),
-                 ctx=ctx)
+    final = unique_path(os.path.join(directory, filename))
+    fd, temporary = tempfile.mkstemp(prefix='.%s.' % filename,
+                                     suffix='.tmp.xlsx', dir=directory)
+    os.close(fd)
+    try:
+        build(items, combos, temporary, ctx=ctx)
+        if ctx is not None:
+            ctx.check_cancel()
+        os.replace(temporary, final)
+        return final
+    except BaseException:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise

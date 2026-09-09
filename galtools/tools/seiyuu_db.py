@@ -21,6 +21,7 @@
 import os
 from dataclasses import dataclass, field
 
+from ..core.context import Cancelled
 from ..core.spec import DIR, TEXT, Field, PreviewResult, RunResult, ToolSpec
 from .vndb_voiced import (
     MAX_LISTED_COMBOS, fetch, store, tables, too_many_people, xlsx,
@@ -316,11 +317,17 @@ def run(params, ctx):
         return RunResult(summary='\n'.join(lines), warnings=_warnings(view),
                          failures=view.bad_files + [('导出目录', str(e))],
                          table=view_table(view))
-    path = xlsx.unique_path(os.path.join(target, workbook_name(view)))
     ctx.log('正在写 Excel…')
     ctx.progress(0, 0, '正在写 Excel…')
     try:
-        xlsx.build(view.items, view.groups, path, ctx=ctx)
+        path = xlsx.save(view.items, view.groups, out_dir, ctx=ctx,
+                         name=workbook_name(view))
+    except Cancelled as stop:
+        stop.partial = RunResult(summary='\n已取消，没有导出文件。',
+                                 warnings=_warnings(view),
+                                 failures=view.bad_files,
+                                 table=view_table(view))
+        raise
     except OSError as e:
         lines.append('写 Excel 失败，没有导出文件：%s' % e)
         return RunResult(summary='\n'.join(lines), warnings=_warnings(view),

@@ -497,6 +497,13 @@ def _run(params, ctx):
         ctx.log('正在写 Excel…')
         try:
             path = xlsx.save(items, groups, params.get('out_dir'), ctx=ctx)
+        except Cancelled as stop:
+            stop.partial = RunResult(
+                summary='\n'.join(lines + ['写 Excel 时取消，没有导出文件。']),
+                output_paths=[path for path in outputs if os.path.exists(path)],
+                warnings=warnings, failures=failures,
+                table=tables.result_table(items, groups))
+            raise
         except OSError as e:
             # 先挡不掉的那几种：磁盘满、整条路径过了 260、目标文件正被 Excel 占着。
             # 抓回来的东西还在 ctx.session 里，换个目录再点一次「开始」不必重抓。
