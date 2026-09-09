@@ -10,6 +10,7 @@ model.py；反过来会让本包去 import 一个 import 本包的包。
 import json
 import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -48,6 +49,14 @@ class Person:
         return self.item.credits
 
 
+def sid_from_path(path):
+    """从库文件名取得身份；只有 `s<id>.json` 才是人物文件。"""
+    match = NAME_RE.match(os.path.basename(path or ''))
+    if not match:
+        return ''
+    return os.path.splitext(os.path.basename(path))[0].lower()
+
+
 def path_for(db_dir, sid):
     return os.path.join(db_dir, '%s.json' % sid)
 
@@ -80,8 +89,7 @@ def to_json(item, fetched_at=None):
 def from_json(data):
     """dict -> StaffCredits。认不出的键忽略，缺的键取 Credit 自己的默认值。
 
-    sid 手改成不像 id 的样子时退回空串而不是拒读整份文件：它只是显示与
-    拼 URL 用的标签（URL 有站点前缀），不至于为一个标签丢一库的数据。
+    独立调用时非法 sid 退回空串；从库文件读取时，read_file 会先用文件名覆盖它。
     """
     sid = _text(data.get('sid'))
     staff = Staff(sid=sid if SID_RE.match(sid) else '',
@@ -100,26 +108,25 @@ def from_json(data):
 
 
 def write_person(db_dir, item, fetched_at=None):
-    """整份覆盖写一个人，返回落盘路径。
+    """整份原子替换一个人，返回落盘路径。
 
-    先写同目录的 .tmp 再 os.replace：抓一次要几分钟，写到一半断电不该把上一份
-    也毁掉。临时文件必须同目录，os.replace 跨盘会失败。
-
-    不合并旧文件里认不出的键：这个目录只有本工具写，合并是为假想的第二个写入者
-    设计的；真有格式变动，schema 号足够让新旧双方认出对方。
+    每个写者使用同目录的唯一临时文件；并发写同一个人时不会互相截断或误删，
+    最后一个成功 os.replace 的完整版本生效。
     """
     sid = item.staff.sid
     if not SID_RE.match(sid or ''):
         raise BadFile('sid 不像 vndb 的人物 id：%r' % (sid,))
     path = path_for(db_dir, sid)
-    tmp = path + '.tmp'
+    fd, tmp = tempfile.mkstemp(prefix='.%s.' % sid, suffix='.tmp', dir=db_dir)
     try:
-        with open(tmp, 'w', encoding='utf-8') as fp:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fp:
+            fd = None
             json.dump(to_json(item, fetched_at), fp,
                       ensure_ascii=False, indent=2)
         os.replace(tmp, path)
-    except Exception:
-        # 不在库里留半份 .tmp：list_files 不认它，只有人眼会被它困惑。
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
         try:
             os.remove(tmp)
         except OSError:
@@ -129,7 +136,10 @@ def write_person(db_dir, item, fetched_at=None):
 
 
 def read_file(path):
-    """读一个文件，返回 Person。读不了就抛 BadFile。"""
+    """读一个人物文件；文件名是唯一身份，内容冲突则拒读。"""
+    file_sid = sid_from_path(path)
+    if not file_sid:
+        raise BadFile('文件名不是 s<id>.json：%s' % os.path.basename(path))
     try:
         with open(path, 'r', encoding='utf-8') as fp:
             data = json.load(fp)
@@ -145,6 +155,11 @@ def read_file(path):
     if isinstance(schema, int) and schema > SCHEMA:
         raise BadFile('这个库比工具新（schema %d，本工具只认到 %d），'
                       '先更新工具再读' % (schema, SCHEMA))
+    content_sid = _text(data.get('sid'))
+    if SID_RE.match(content_sid) and content_sid.lower() != file_sid:
+        raise BadFile('文件名是 %s，但内容 sid 是 %s，身份冲突' %
+                      (file_sid, content_sid))
+    data = dict(data, sid=file_sid)
     return Person(item=from_json(data), fetched_at=_text(data.get('fetched_at')),
                   path=path)
 

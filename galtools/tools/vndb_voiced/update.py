@@ -4,8 +4,6 @@
 纯逻辑，不 import 网络：抓取与读库在 tool.py 里汇合，这里只负责「谁变了、
 变了什么、表格怎么摆」，整个模块都能离线测试。
 """
-import os
-import re
 from dataclasses import dataclass, field
 
 from ...core.spec import Table
@@ -25,9 +23,6 @@ STATUS_LABEL = {
     FAILED: '失败',
 }
 
-# store.NAME_RE 的小写捕获版：文件内容里的 sid 坏了时，身份从文件名救回来。
-SID_FROM_NAME = re.compile(r'^(s\d+)\.json$', re.IGNORECASE)
-
 
 @dataclass
 class Entry:
@@ -41,15 +36,8 @@ class Entry:
 
 
 def person_key(person):
-    """更新用的身份键：文件里的 sid 优先，坏了从文件名救，都不行就原样返回。
-
-    tool.py 建 fresh/errors 两个字典时用同一个键，这里查字典才不会对不上。
-    """
-    sid = person.staff.sid
-    if store.SID_RE.match(sid or ''):
-        return sid
-    match = SID_FROM_NAME.match(os.path.basename(person.path or ''))
-    return match.group(1).lower() if match else (sid or '')
+    """更新用的身份键：库文件名是唯一来源。"""
+    return store.sid_from_path(person.path) or person.staff.sid
 
 
 def credit_key(credit):

@@ -93,11 +93,11 @@ def test_build_entries_reports_missing_fetch_result():
     assert '没有抓取结果' in entries[0].error
 
 
-def test_person_key_falls_back_to_the_file_name():
+def test_person_key_uses_the_file_name_as_identity():
     person = make_person(sid='', path=os.path.join('lib', 's42.json'))
     assert update.person_key(person) == 's42'
     person = make_person(sid='s7', path=os.path.join('lib', 's42.json'))
-    assert update.person_key(person) == 's7'
+    assert update.person_key(person) == 's42'
 
 
 def test_update_table_lists_counts_and_status():

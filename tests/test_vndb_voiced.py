@@ -1380,14 +1380,14 @@ def test_a_persons_db_write_failure_only_blames_himself(monkeypatch, tmp_path):
     assert '本地库 : 1/2 人' in result.summary
 
 
-def test_a_hand_edited_sid_falls_back_to_empty_on_read(tmp_path):
-    """库文件是用户能手改的：sid 不像 id 时退回空串，其余字段照读，不拒读整份。"""
+def test_a_hand_edited_invalid_sid_is_recovered_from_the_file_name(tmp_path):
+    """库文件是用户能手改的：非法 sid 不得盖过作为身份的文件名。"""
     payload = {'schema': store.SCHEMA, 'sid': '../s1', 'name': 'X',
                'original': 'エックス',
                'credits': [{'vid': 'v1', 'title': 'Alpha'}]}
     (tmp_path / 's1.json').write_text(json.dumps(payload), encoding='utf-8')
     person = store.read_person(str(tmp_path), 's1')
-    assert person.staff.sid == ''
+    assert person.staff.sid == 's1'
     assert person.staff.name == 'X'
     assert [c.vid for c in person.credits] == ['v1']
 

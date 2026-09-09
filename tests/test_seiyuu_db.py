@@ -6,6 +6,7 @@
 import dataclasses
 import json
 import os
+import threading
 
 import pytest
 
@@ -111,6 +112,49 @@ def test_failed_write_leaves_no_tmp_behind(tmp_path, monkeypatch):
     assert [c.vid for c in store.read_person(str(tmp_path), 's1').credits] == ['v1']
 
 
+def test_concurrent_writers_use_separate_temporary_files(tmp_path, monkeypatch):
+    real_dump = store.json.dump
+    real_replace = store.os.replace
+    barrier = threading.Barrier(2)
+    release_first = threading.Event()
+    replaced = []
+
+    def together(obj, fp, **kw):
+        barrier.wait(timeout=5)
+        return real_dump(obj, fp, **kw)
+
+    def serialized_replace(src, dst):
+        if not replaced:
+            replaced.append(src)
+            result = real_replace(src, dst)
+            release_first.set()
+            return result
+        assert release_first.wait(5)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(store.json, 'dump', together)
+    monkeypatch.setattr(store.os, 'replace', serialized_replace)
+    errors = []
+
+    def write(vid):
+        try:
+            store.write_person(str(tmp_path), person(credits=[credit(vid)]))
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=write, args=(vid,))
+               for vid in ('v1', 'v2')]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(os.listdir(str(tmp_path))) == ['s1.json']
+    assert store.read_person(str(tmp_path), 's1').credits[0].vid in ('v1', 'v2')
+
+
 # ---------------- 容错 ----------------
 def test_unknown_keys_are_ignored(tmp_path):
     dump(tmp_path, 's1.json', {'schema': 1, 'sid': 's1', 'name': 'Alpha One',
@@ -120,6 +164,16 @@ def test_unknown_keys_are_ignored(tmp_path):
     got = store.read_person(str(tmp_path), 's1')
     assert got.staff.sid == 's1'
     assert [c.vid for c in got.credits] == ['v1']
+
+
+def test_file_name_is_the_only_identity_source(tmp_path):
+    dump(tmp_path, 's1.json', {'schema': 1, 'sid': 's2', 'name': 'Wrong'})
+    with pytest.raises(store.BadFile, match='文件名.*s1.*内容.*s2'):
+        store.read_person(str(tmp_path), 's1')
+
+    people, failures = store.read_all(str(tmp_path))
+    assert people == []
+    assert [name for name, _ in failures] == ['s1.json']
 
 
 def test_schema_from_the_future_is_refused(tmp_path):
