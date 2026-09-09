@@ -5,6 +5,7 @@
 时长）；ogg 无法用标准库合成，改为手工拼出解析器实际读的那几个字段——这样
 连 Opus 的 preskip 扣减这种容易写错的细节也能钉住。
 """
+import math
 import os
 import shutil
 import struct
@@ -29,14 +30,16 @@ def make_wav(path, seconds, rate=8000, channels=1, width=2):
     return str(path)
 
 
-def wav_header(data_size, rate=8000, channels=1, bits=16):
-    """只有头、没有真实采样数据的 wav。data 的声明长度可以随便撒谎——
-    解析器算的是 data_size / byte_rate，从不读采样。"""
-    fmt = struct.pack('<HHIIHH', 1, channels, rate,
+def wav_header(data_size, rate=8000, channels=1, bits=16, format_tag=1,
+               riff_size=None):
+    """生成物理 payload 完整的 WAV，可单独覆盖顶层 RIFF 声明长度。"""
+    fmt = struct.pack('<HHIIHH', format_tag, channels, rate,
                       rate * channels * bits // 8, channels * bits // 8, bits)
+    payload = b'\x00' * data_size
     body = (b'WAVE' + b'fmt ' + struct.pack('<I', len(fmt)) + fmt
-            + b'data' + struct.pack('<I', data_size))
-    return b'RIFF' + struct.pack('<I', len(body)) + body
+            + b'data' + struct.pack('<I', data_size) + payload)
+    declared = len(body) if riff_size is None else riff_size
+    return b'RIFF' + struct.pack('<I', declared) + body
 
 
 def ogg_page(granule, eos=True):
@@ -76,13 +79,26 @@ def test_wav_skips_unknown_chunks(tmp_path):
     fmt = struct.pack('<HHIIHH', 1, 1, 8000, 16000, 2, 16)
     body = (b'WAVE' + b'LIST' + struct.pack('<I', 4) + b'INFO'
             + b'fmt ' + struct.pack('<I', len(fmt)) + fmt
-            + b'data' + struct.pack('<I', 16000))
+            + b'data' + struct.pack('<I', 16000) + b'\x00' * 16000)
     path = write(tmp_path / 'a.wav', b'RIFF' + struct.pack('<I', len(body)) + body)
     assert core.parse_wav_duration(path) == pytest.approx(1.0)
 
 
 def test_wav_rejects_non_riff(tmp_path):
     assert core.parse_wav_duration(write(tmp_path / 'a.wav', b'not a wav')) is None
+
+
+def test_wav_rejects_truncated_payload_and_non_pcm(tmp_path):
+    complete = wav_header(16000)
+    assert core.parse_wav_duration(
+        write(tmp_path / 'truncated.wav', complete[:-1])) is None
+    assert core.parse_wav_duration(
+        write(tmp_path / 'float.wav', wav_header(16000, format_tag=3))) is None
+
+
+def test_wav_tolerates_wrong_top_level_riff_length(tmp_path):
+    path = write(tmp_path / 'a.wav', wav_header(16000, riff_size=1))
+    assert core.parse_wav_duration(path) == pytest.approx(1.0)
 
 
 def test_wav_rejects_missing_data_chunk(tmp_path):
@@ -181,12 +197,14 @@ def test_scan_recursive_prunes_own_output_dirs(tmp_path):
     assert names == ['子.wav', '短.wav', '长.wav']    # 上次的产物被剔除
 
 
-def test_out_dir_pattern_misses_romaji_names():
-    """既有缺陷，钉住而不修：剔除规则只认中文命名，罗马字命名的历史输出目录
-    递归时仍会被重复扫进来。靠预览里的文件总数让用户当场看出数字不对。"""
-    assert core.OUT_DIR_PATTERN.match('chika_大于6秒')
-    assert core.OUT_DIR_PATTERN.match('chika_大于6.5秒')
-    assert not core.OUT_DIR_PATTERN.match('chika_dayu7miaoqiebuchao9miao - fuben')
+def test_out_dir_pattern_only_matches_complete_generated_names():
+    for name in ('chika_大于6秒', 'chika_大于6.5秒',
+                 'chika_大于1e-06秒且不超9E+2秒',
+                 'chika_大于6秒且不超9秒_2'):
+        assert core.OUT_DIR_PATTERN.fullmatch(name)
+    for name in ('chika_大于6秒备份', 'prefix_chika_大于6秒_extra',
+                 'chika_dayu7miaoqiebuchao9miao - fuben'):
+        assert not core.OUT_DIR_PATTERN.fullmatch(name)
 
 
 def test_scan_counts_unparsable_as_failure(tmp_path):
@@ -237,6 +255,26 @@ def test_scan_reports_progress_and_honours_cancel(tmp_path):
 
     with pytest.raises(Cancelled):
         core.scan_audio_files(str(root), recursive=False, ctx=Canceller())
+
+
+def test_scan_checks_cancel_after_the_last_parse(tmp_path):
+    root = tmp_path / 'root'
+    root.mkdir()
+    make_wav(root / 'only.wav', 1.0)
+
+    class CancelAfterParse(RunContext):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def check_cancel(self):
+            self.calls += 1
+            if self.calls == 2:
+                raise Cancelled()
+
+    with pytest.raises(Cancelled):
+        core.scan_audio_files(str(root), recursive=False,
+                              ctx=CancelAfterParse())
 
 
 # ---------------- 缓存 ----------------
@@ -316,6 +354,13 @@ def test_fmt_num_drops_pointless_decimals():
     assert core.fmt_num(0.1) == '0.1'
 
 
+def test_fmt_num_rejects_non_finite_and_keeps_tiny_positive():
+    assert core.fmt_num(1e-10) == '1e-10'
+    for value in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError):
+            core.fmt_num(value)
+
+
 def test_out_dir_name():
     assert core.out_dir_name(r'X:\a\chika', 6, None) == 'chika_大于6秒'
     assert core.out_dir_name(r'X:\a\chika\\', 7, 9) == 'chika_大于7秒且不超9秒'
@@ -390,8 +435,10 @@ def test_copy_hits_collects_failures(tmp_path):
     out.mkdir()
     good = make_wav(tmp_path / 'good.wav', 1.0)
     hits = [(good, 1.0, 100), (str(tmp_path / '不存在.wav'), 2.0, 100)]
-    copied, failed, manifest = core.copy_hits(hits, str(out), RunContext())
+    copied, copied_bytes, failed, manifest = core.copy_hits(
+        hits, str(out), RunContext())
     assert copied == 1
+    assert copied_bytes == 100
     assert [os.path.basename(p) for p, _ in failed] == ['不存在.wav']
     assert manifest == [('good.wav', 1.0)]
 
@@ -400,9 +447,13 @@ def test_write_manifests_layout(tmp_path):
     out = tmp_path / 'out'
     out.mkdir()
     hits = audio_set(9, 7)
-    path = core.write_manifests(str(out), 'X:\\src', '时长 > 6 秒', hits, 2,
-                                [('9.ogg', 9.0), ('7.ogg', 7.0)],
-                                ['X:\\src\\坏.ogg'], [], RunContext())
+    paths, failures = core.write_manifests(
+        str(out), 'X:\\src', '时长 > 6 秒', hits, 2, 200,
+        [('9.ogg', 9.0), ('7.ogg', 7.0)],
+        ['X:\\src\\坏.ogg'], [], RunContext())
+    assert failures == []
+    assert len(paths) == 2
+    path = paths[0]
     text = open(path, encoding='utf-8').read()
     lines = text.splitlines()
     assert lines[0] == '复制清单'
@@ -411,6 +462,70 @@ def test_write_manifests_layout(tmp_path):
     assert text.endswith('\n')
     assert (out / core.SCAN_FAIL_NAME).exists()
     assert not (out / core.COPY_FAIL_NAME).exists()
+
+
+def test_write_manifests_reports_only_real_paths_and_keeps_old_file(
+        tmp_path, monkeypatch):
+    out = tmp_path / 'out'
+    out.mkdir()
+    old = out / core.MANIFEST_NAME
+    old.write_text('old', encoding='utf-8')
+    real_replace = core.os.replace
+
+    def fail_main(src, dst):
+        if dst == str(old):
+            raise OSError('盘满')
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(core.os, 'replace', fail_main)
+    paths, failures = core.write_manifests(
+        str(out), 'src', 'cond', audio_set(9), 1, 100,
+        [('9.ogg', 9.0)], ['bad.ogg'], [], RunContext())
+    assert str(old) not in paths
+    assert str(out / core.SCAN_FAIL_NAME) in paths
+    assert failures == [(core.MANIFEST_NAME, '盘满')]
+    assert old.read_text(encoding='utf-8') == 'old'
+    assert not any('.tmp' in name for name in os.listdir(out))
+
+
+def test_write_manifests_reports_each_failed_list(tmp_path, monkeypatch):
+    out = tmp_path / 'out'
+    out.mkdir()
+    real = core.write_text
+
+    def fail_secondary(path, text, ctx):
+        if path.endswith((core.SCAN_FAIL_NAME, core.COPY_FAIL_NAME)):
+            return '', '拒绝'
+        return real(path, text, ctx)
+
+    monkeypatch.setattr(core, 'write_text', fail_secondary)
+    paths, failures = core.write_manifests(
+        str(out), 'src', 'cond', audio_set(9), 0, 0, [], ['bad.ogg'],
+        [('copy.ogg', '丢失')], RunContext())
+    assert paths == [str(out / core.MANIFEST_NAME)]
+    assert failures == [(core.SCAN_FAIL_NAME, '拒绝'),
+                        (core.COPY_FAIL_NAME, '拒绝')]
+
+
+def test_write_manifests_cancel_stops_before_later_lists(tmp_path):
+    out = tmp_path / 'out'
+    out.mkdir()
+
+    class CancelAfterMain(RunContext):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def check_cancel(self):
+            self.calls += 1
+            if self.calls == 3:
+                raise Cancelled()
+
+    with pytest.raises(Cancelled):
+        core.write_manifests(str(out), 'src', 'cond', audio_set(9), 1, 100,
+                             [('9.ogg', 9.0)], ['bad.ogg'], [],
+                             CancelAfterMain())
+    assert os.listdir(out) == [core.MANIFEST_NAME]
 
 
 # ---------------- 校验 ----------------
@@ -434,6 +549,15 @@ def test_validate_rejects_non_positive_numbers(tmp_path):
         [('threshold', '必须为正数')]
     assert validate({'src': str(tmp_path), 'threshold': 6.0,
                      'max_limit': -1.0}) == [('max_limit', '必须为正数')]
+
+
+def test_validate_rejects_non_finite_numbers(tmp_path):
+    for value in (math.nan, math.inf, -math.inf):
+        assert validate({'src': str(tmp_path), 'threshold': value}) == [
+            ('threshold', '必须是有限数字')]
+        assert validate({'src': str(tmp_path), 'threshold': 6.0,
+                         'max_limit': value}) == [
+            ('max_limit', '必须是有限数字')]
 
 
 def test_validate_rejects_missing_dir(tmp_path):
@@ -471,6 +595,11 @@ def test_wizard_threshold_rejects_exactly_what_validate_rejects(monkeypatch):
         _feed(monkeypatch, [bad, '6'])
         assert cli.ask_threshold() == 6.0
         assert validate({'threshold': float(bad)}) == [('threshold', '必须为正数')]
+    for bad in ('nan', 'inf', '-inf'):
+        _feed(monkeypatch, [bad, '6'])
+        assert cli.ask_threshold() == 6.0
+        assert validate({'threshold': float(bad)}) == [
+            ('threshold', '必须是有限数字')]
     # 非数字在 GUI 侧由 bad_number 报「填数字」，validate 见不到它；向导这一侧
     # 只管拒收重问。
     _feed(monkeypatch, ['abc', '6'])
@@ -492,6 +621,12 @@ def test_wizard_max_limit_matches_validate(monkeypatch):
         assert cli.ask_max_limit(threshold) == 15.0
         assert validate({'threshold': threshold,
                          'max_limit': float(bad)}) == [('max_limit', reason)]
+    for bad in ('nan', 'inf', '-inf'):
+        _feed(monkeypatch, [bad, '15'])
+        assert cli.ask_max_limit(threshold) == 15.0
+        assert validate({'threshold': threshold,
+                         'max_limit': float(bad)}) == [
+            ('max_limit', '必须是有限数字')]
     _feed(monkeypatch, ['abc', '15'])
     assert cli.ask_max_limit(threshold) == 15.0
 
@@ -509,6 +644,46 @@ def test_run_clears_scan_cache(tmp_path):
     assert '复制成功 : 1 个' in result.summary
     out = os.path.join(str(src), 'src_大于6秒')
     assert sorted(os.listdir(out)) == sorted(['长.wav', core.MANIFEST_NAME])
+
+
+def test_run_reports_manifest_failure_without_claiming_completion(
+        tmp_path, monkeypatch):
+    params = one_hit(tmp_path)
+    real_replace = core.os.replace
+
+    def fail_manifest(src, dst):
+        if dst.endswith(core.MANIFEST_NAME):
+            raise OSError('盘满')
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(core.os, 'replace', fail_manifest)
+    result = run(params, RunContext())
+    assert '复制完成，但有清单写入失败' in result.summary
+    assert all(not path.endswith(core.MANIFEST_NAME) for path in result.output_paths)
+    assert [('清单 ' + core.MANIFEST_NAME, '盘满')] == result.failures
+    assert os.path.isdir(result.output_paths[0])
+
+
+def test_run_cancel_before_manifests_keeps_copied_partial(tmp_path):
+    params = one_hit(tmp_path)
+
+    class CancelAfterCopy(RunContext):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def check_cancel(self):
+            self.calls += 1
+            # 扫描前/后、复制前/后，下一次是 run 的清单提交边界。
+            if self.calls == 5:
+                raise Cancelled()
+
+    with pytest.raises(Cancelled) as caught:
+        run(params, CancelAfterCopy())
+    out = caught.value.partial.output_paths[0]
+    assert os.path.isdir(out)
+    assert '长.wav' in os.listdir(out)
+    assert core.MANIFEST_NAME not in os.listdir(out)
 
 
 def test_run_without_hits_does_not_create_output_dir(tmp_path):

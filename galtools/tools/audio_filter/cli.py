@@ -6,6 +6,7 @@
 
 setup_console 与 msvcrt 只在这条路径上出现，import 时不执行任何副作用。
 """
+import math
 import os
 import sys
 
@@ -67,6 +68,9 @@ def ask_threshold():
         except ValueError:
             print('  [!] 无法识别的数字，请重新输入（例如 6 或 6.5）。')
             continue
+        if not math.isfinite(val):
+            print('  [!] 阈值必须是有限数字，请重新输入。')
+            continue
         if val <= 0:
             print('  [!] 阈值必须为正数，请重新输入。')
             continue
@@ -91,6 +95,9 @@ def ask_max_limit(threshold):
             val = float(raw)
         except ValueError:
             print('  [!] 无法识别的数字，请重新输入（例如 15 或 15.5）。')
+            continue
+        if not math.isfinite(val):
+            print('  [!] 最大值必须是有限数字，请重新输入。')
             continue
         if val <= 0:
             print('  [!] 最大值必须为正数，请重新输入。')

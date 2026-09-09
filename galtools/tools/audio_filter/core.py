@@ -18,11 +18,13 @@
 - OUT_DIR_PATTERN 只匹配中文命名的输出目录，罗马字命名的历史输出目录递归
   时仍会被重复扫进来。不改，靠预览里的文件总数让用户当场看出数字不对。
 """
+import math
 import os
 import re
 import shutil
 import statistics
 import struct
+import tempfile
 
 from ...core.context import Cancelled
 from ...core.spec import RunResult
@@ -32,8 +34,10 @@ SUPPORTED_EXTS = {'.ogg', '.wav'}
 TAIL_WINDOW = 65536          # 从文件尾部反读的窗口大小（字节）
 MAX_SANE_DURATION = 120.0    # 超过该值视为解析异常（游戏语音不可能超过 2 分钟）
 
-# 本工具输出目录的命名模式，递归扫描时剔除，防止上次运行结果被再次扫入。
-OUT_DIR_PATTERN = re.compile(r'.+_大于\d+(\.\d+)?秒')
+# 本工具输出目录的命名模式，递归扫描时只剔除完整匹配的自产目录。
+_NUM_PATTERN = r'(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
+OUT_DIR_PATTERN = re.compile(
+    r'^.+_大于%s秒(?:且不超%s秒)?(?:_\d+)?$' % (_NUM_PATTERN, _NUM_PATTERN))
 
 MANIFEST_NAME = '复制清单.txt'
 SCAN_FAIL_NAME = '解析失败清单.txt'
@@ -41,9 +45,11 @@ COPY_FAIL_NAME = '复制失败清单.txt'
 
 
 def fmt_num(x):
-    """智能格式化数字：6.0 -> '6'，6.5 -> '6.5'。"""
-    if abs(x - round(x)) < 1e-9:
-        return str(int(round(x)))
+    """智能格式化有限数字：6.0 -> '6'，6.5 -> '6.5'。"""
+    if not math.isfinite(x):
+        raise ValueError('数字必须有限')
+    if x == int(x):
+        return str(int(x))
     return '%g' % x
 
 
@@ -87,30 +93,40 @@ def parse_wav_duration(path):
     """返回 WAV(PCM) 文件时长（秒），无法解析返回 None。"""
     try:
         with open(path, 'rb') as fp:
+            fp.seek(0, os.SEEK_END)
+            file_size = fp.tell()
+            fp.seek(0)
             hdr = fp.read(12)
-            if hdr[:4] != b'RIFF' or hdr[8:12] != b'WAVE':
+            if len(hdr) < 12 or hdr[:4] != b'RIFF' or hdr[8:12] != b'WAVE':
                 return None
-            rate = channels = bits = None
+            rate = channels = bits = format_tag = None
             data_size = None
-            while True:
+            while fp.tell() < file_size:
+                if file_size - fp.tell() < 8:
+                    return None
                 ck = fp.read(8)
-                if len(ck) < 8:
-                    break
                 cid = ck[:4]
                 size = struct.unpack('<I', ck[4:])[0]
+                padded = size + (size & 1)
+                if size > file_size - fp.tell() or padded > file_size - fp.tell():
+                    return None
                 if cid == b'fmt ':
                     d = fp.read(size)
                     if len(d) < 16:
                         return None
+                    format_tag = struct.unpack('<H', d[:2])[0]
                     channels = struct.unpack('<H', d[2:4])[0]
                     rate = struct.unpack('<I', d[4:8])[0]
                     bits = struct.unpack('<H', d[14:16])[0]
+                    if size & 1:
+                        fp.seek(1, os.SEEK_CUR)
                 elif cid == b'data':
                     data_size = size
-                    fp.seek(size + (size & 1), os.SEEK_CUR)
+                    fp.seek(padded, os.SEEK_CUR)
                 else:
-                    fp.seek(size + (size & 1), os.SEEK_CUR)
-            if not (rate and channels and bits and data_size is not None):
+                    fp.seek(padded, os.SEEK_CUR)
+            if format_tag != 1 or not (rate and channels and bits
+                                       and data_size is not None):
                 return None
             byte_rate = rate * channels * bits // 8
             if byte_rate == 0:
@@ -149,7 +165,7 @@ def scan_audio_files(src, recursive, ctx=None):
     paths = []
     if recursive:
         for root, dirs, files in os.walk(src):
-            dirs[:] = [d for d in dirs if not OUT_DIR_PATTERN.match(d)]
+            dirs[:] = [d for d in dirs if not OUT_DIR_PATTERN.fullmatch(d)]
             for name in files:
                 paths.append(os.path.join(root, name))
     else:
@@ -177,6 +193,8 @@ def scan_audio_files(src, recursive, ctx=None):
             audio.append((p, d, size))
         if ctx is not None:
             ctx.progress(idx, total, '解析时长 %d/%d' % (idx, total))
+    if ctx is not None:
+        ctx.check_cancel()
     return audio, failed, len(audio) + len(failed)
 
 
@@ -258,64 +276,89 @@ def unique_dest(path):
 
 
 def copy_hits(hits, out_dir, ctx):
-    """返回 (成功数, 失败列表[(路径, 原因)], 清单条目[(目标文件名, 时长)])。
-
-    取消时抛 Cancelled 并挂上部分结果：已复制的文件留在输出目录，清单不写，
-    与命令行版 Ctrl+C 的承诺一致。
-    """
-    copied, copy_failed, manifest = 0, [], []
+    """返回 (成功数, 成功字节, 失败列表, 清单条目)。"""
+    copied, copied_bytes, copy_failed, manifest = 0, 0, [], []
     total = len(hits)
     try:
-        for idx, (p, d, _size) in enumerate(hits, 1):
+        for idx, (p, d, size) in enumerate(hits, 1):
             ctx.check_cancel()
             dest = unique_dest(os.path.join(out_dir, os.path.basename(p)))
             try:
                 shutil.copy2(p, dest)
                 copied += 1
+                copied_bytes += size
                 manifest.append((os.path.basename(dest), d))
             except OSError as e:
                 copy_failed.append((p, str(e)))
             ctx.progress(idx, total, '复制进度: %d/%d (%.1f%%)  失败: %d'
                          % (idx, total, idx / total * 100, len(copy_failed)))
+        ctx.check_cancel()
     except Cancelled as c:
         c.partial = RunResult(
             summary='已复制 %d / %d 个，保留在 %s' % (copied, total, out_dir),
             output_paths=[out_dir], failures=copy_failed)
         raise
-    return copied, copy_failed, manifest
+    return copied, copied_bytes, copy_failed, manifest
 
 
 def write_text(path, text, ctx):
+    """原子写一份清单，返回 (成功路径, 错误消息)。"""
+    directory = os.path.dirname(path) or '.'
     try:
-        with open(path, 'w', encoding='utf-8') as fp:
-            fp.write(text)
+        fd, temporary = tempfile.mkstemp(prefix='.%s.' % os.path.basename(path),
+                                         suffix='.tmp', dir=directory)
     except OSError as e:
         ctx.log('清单写入失败: %s (%s)' % (path, e), 'warn')
+        return '', str(e)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fp:
+            fp.write(text)
+        ctx.check_cancel()
+        os.replace(temporary, path)
+        return path, ''
+    except Cancelled:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
+    except OSError as e:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        ctx.log('清单写入失败: %s (%s)' % (path, e), 'warn')
+        return '', str(e)
 
 
-def write_manifests(out_dir, src, cond_desc, hits, copied, manifest,
-                    scan_failed, copy_failed, ctx):
-    """写复制清单，另把两类失败落盘成清单。返回复制清单路径。"""
-    total_size = sum(s for _, _, s in hits)
+def write_manifests(out_dir, src, cond_desc, hits, copied, copied_bytes,
+                    manifest, scan_failed, copy_failed, ctx):
+    """原子写各份清单，返回 (成功路径列表, 失败列表)。"""
     lines = [
         '复制清单',
         '源目录    : %s' % src,
         '筛选条件  : %s' % cond_desc,
         '命中文件  : %d 个' % len(hits),
         '复制成功  : %d 个' % copied,
-        '复制大小  : %.1f MB' % (total_size / 1024 / 1024),
+        '复制大小  : %.1f MB' % (copied_bytes / 1024 / 1024),
         '-' * 60,
         '文件名\t时长(秒)',
     ]
     lines += ['%s\t%.2f' % (name, d) for name, d in manifest]
-    manifest_path = os.path.join(out_dir, MANIFEST_NAME)
-    write_text(manifest_path, '\n'.join(lines) + '\n', ctx)
-
+    specs = [(MANIFEST_NAME, '\n'.join(lines) + '\n')]
     if scan_failed:
-        write_text(os.path.join(out_dir, SCAN_FAIL_NAME),
-                   '\n'.join(scan_failed) + '\n', ctx)
+        specs.append((SCAN_FAIL_NAME, '\n'.join(scan_failed) + '\n'))
     if copy_failed:
-        write_text(os.path.join(out_dir, COPY_FAIL_NAME),
-                   '\n'.join('%s\t%s' % (p, err) for p, err in copy_failed) + '\n',
-                   ctx)
-    return manifest_path
+        specs.append((COPY_FAIL_NAME,
+                      '\n'.join('%s\t%s' % item for item in copy_failed) + '\n'))
+
+    paths, failures = [], []
+    for name, text in specs:
+        ctx.check_cancel()
+        path = os.path.join(out_dir, name)
+        written, error = write_text(path, text, ctx)
+        if written:
+            paths.append(written)
+        else:
+            failures.append((name, error))
+    return paths, failures

@@ -5,9 +5,11 @@
 回退重设阈值」的循环。GUI 里这个循环由 preview 取代：改阈值立刻看到命中几
 个、多少 MB、磁盘够不够，确认步骤自然消失。向导本身保留在 cli.py。
 """
+import math
 import os
 import shutil
 
+from ...core.context import Cancelled
 from ...core.spec import BOOL, DIR, NUMBER, Field, PreviewResult, RunResult, ToolSpec
 from . import core
 
@@ -18,13 +20,18 @@ def validate(params):
     if src and not os.path.isdir(src):
         errors.append(('src', '目录不存在或不可访问'))
     threshold = params.get('threshold')
-    if threshold is not None and threshold <= 0:
-        errors.append(('threshold', '必须为正数'))
+    if threshold is not None:
+        if not math.isfinite(threshold):
+            errors.append(('threshold', '必须是有限数字'))
+        elif threshold <= 0:
+            errors.append(('threshold', '必须为正数'))
     max_limit = params.get('max_limit')
     if max_limit is not None:
-        if max_limit <= 0:
+        if not math.isfinite(max_limit):
+            errors.append(('max_limit', '必须是有限数字'))
+        elif max_limit <= 0:
             errors.append(('max_limit', '必须为正数'))
-        elif threshold is not None and max_limit <= threshold:
+        elif threshold is not None and math.isfinite(threshold) and max_limit <= threshold:
             errors.append(('max_limit', '必须大于筛选阈值'))
     return errors
 
@@ -100,32 +107,49 @@ def run(params, ctx):
     ctx.log('\n输出目录       : %s' % out_dir)
     ctx.log('开始复制...\n')
     try:
-        copied, copy_failed, manifest = core.copy_hits(hits, out_dir, ctx)
+        copied, copied_bytes, copy_failed, manifest = core.copy_hits(
+            hits, out_dir, ctx)
     finally:
         # 输出目录就建在源目录内，这次之后的扫描结果本就该不同。
         ctx.session.pop('scan', None)
     ctx.log('复制完成，正在生成清单...')
+    try:
+        ctx.check_cancel()
+        manifest_paths, manifest_failed = core.write_manifests(
+            out_dir, src, cond_desc, hits, copied, copied_bytes, manifest,
+            scan_failed, copy_failed, ctx)
+    except Cancelled as stop:
+        stop.partial = RunResult(
+            summary='已复制 %d / %d 个，清单未全部生成' % (copied, len(hits)),
+            output_paths=[out_dir], failures=copy_failed)
+        raise
 
-    manifest_path = core.write_manifests(
-        out_dir, src, cond_desc, hits, copied, manifest, scan_failed,
-        copy_failed, ctx)
-
+    failures = copy_failed + [('清单 ' + name, reason)
+                              for name, reason in manifest_failed]
     lines = ['\n========== 执行结果 ==========', '复制成功 : %d 个' % copied]
     if copy_failed:
-        lines.append('复制失败 : %d 个（详见 %s）'
-                     % (len(copy_failed), core.COPY_FAIL_NAME))
-    lines += ['输出目录 : %s' % out_dir,
-              '复制清单 : %s' % manifest_path,
-              '=' * 30,
-              '全部完成。']
+        lines.append('复制失败 : %d 个' % len(copy_failed))
+    lines.append('输出目录 : %s' % out_dir)
+    if manifest_paths:
+        lines.append('清单文件 : %d 份' % len(manifest_paths))
+    if manifest_failed:
+        lines += ['清单失败 : %d 份' % len(manifest_failed),
+                  '=' * 30, '复制完成，但有清单写入失败。']
+    else:
+        lines += ['=' * 30, '全部完成。']
     warnings = []
     if scan_failed:
-        warnings.append('%d 个文件解析失败，已写入 %s'
-                        % (len(scan_failed), core.SCAN_FAIL_NAME))
+        if os.path.join(out_dir, core.SCAN_FAIL_NAME) in manifest_paths:
+            warnings.append('%d 个文件解析失败，已写入 %s'
+                            % (len(scan_failed), core.SCAN_FAIL_NAME))
+        else:
+            warnings.append('%d 个文件解析失败，但失败清单未写成'
+                            % len(scan_failed))
+    if manifest_failed:
+        warnings.append('%d 份清单写入失败。' % len(manifest_failed))
     return RunResult(summary='\n'.join(lines),
-                     output_paths=[out_dir, manifest_path],
-                     warnings=warnings,
-                     failures=copy_failed)
+                     output_paths=[out_dir] + manifest_paths,
+                     warnings=warnings, failures=failures)
 
 
 TOOL = ToolSpec(
