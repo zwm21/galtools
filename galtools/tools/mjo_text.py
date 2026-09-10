@@ -266,9 +266,17 @@ def run(params, ctx):
                 failed.append((name, str(e)))
                 continue
             ctx.check_cancel()
-            total_lines += len(lines)
             stem = os.path.splitext(name)[0]
-            write_text_atomic(os.path.join(out_dir, stem + '.txt'), '\n'.join(lines))
+            try:
+                write_text_atomic(os.path.join(out_dir, stem + '.txt'),
+                                  '\n'.join(lines))
+            except OSError as e:
+                # 写不出去和解析不了一样是「这一个文件的事」。放任它冒出去会掀掉
+                # 整轮提取，连同已经写好的几百个 txt 一起只剩一段栈——而临时名比
+                # 正式名长十几个字符，一个逼近 260 的路径就足以触发。
+                failed.append((name, '写出失败: %s' % e))
+                continue
+            total_lines += len(lines)
             succeeded.append((stem, lines))
         ctx.check_cancel()
     except Cancelled as stop:
@@ -279,11 +287,18 @@ def run(params, ctx):
         raise
 
     if not succeeded:
+        # 这一轮什么都没写进去，out_dir 又可能是刚建的。rmdir 只删得掉空目录，
+        # 里面有旧成果时它自己会失败，正好是想要的语义。
+        try:
+            os.rmdir(out_dir)
+        except OSError:
+            pass
         parts = ['处理 %d 个 mjo，成功 0 个，合并全文未改动' % len(files),
                  '失败列表:']
         parts.extend('  %s: %s' % (n, e) for n, e in failed)
         return RunResult(summary='\n'.join(parts), failures=failed)
 
+    merged_error = ''
     try:
         ctx.progress(len(files), len(files), '写出合并全文')
         merged = [f'{"=" * 60}\n【{stem}】\n{"=" * 60}\n'
@@ -296,6 +311,9 @@ def run(params, ctx):
                     % (len(succeeded), len(files)),
             output_paths=[out_dir], failures=failed)
         raise
+    except OSError as e:
+        merged_error = str(e)
+        failed.append((MERGED_NAME, '写出失败: %s' % e))
 
     parts = ['处理 %d 个 mjo，成功 %d 个，共提取 %d 条文本'
              % (len(files), len(succeeded), total_lines)]
@@ -303,10 +321,16 @@ def run(params, ctx):
         parts.append('失败列表:')
         parts.extend('  %s: %s' % (n, e) for n, e in failed)
     parts.append('单文件输出目录: %s' % out_dir)
-    parts.append('合并全文: %s' % merged_path)
+    if merged_error:
+        parts.append('合并全文未写成: %s（旧文件保持原样）' % merged_path)
+        warnings = ['合并全文写入失败，单文件 txt 已经写好。']
+    else:
+        parts.append('合并全文: %s' % merged_path)
+        warnings = []
     return RunResult(
         summary='\n'.join(parts),
-        output_paths=[out_dir, merged_path],
+        output_paths=[out_dir] if merged_error else [out_dir, merged_path],
+        warnings=warnings,
         failures=failed,
     )
 

@@ -367,6 +367,95 @@ def test_atomic_text_write_keeps_the_previous_file_on_failure(tmp_path, monkeypa
     assert os.listdir(str(tmp_path)) == ['old.txt']
 
 
+def test_single_file_write_failure_does_not_abort_the_batch(tmp_path, monkeypatch):
+    """一个文件写不出去只算它自己失败，其余 txt 与合并全文照常产出。"""
+    import galtools.tools.mjo_text as mod
+
+    src = tmp_path / 'src'
+    src.mkdir()
+    (src / 'a.mjo').write_bytes(build_mjo(show_text('あ')))
+    (src / 'b.mjo').write_bytes(build_mjo(show_text('い')))
+    real_write = mod.write_text_atomic
+
+    def picky(path, text):
+        if os.path.basename(path) == 'a.txt':
+            raise OSError('文件名过长')
+        return real_write(path, text)
+
+    monkeypatch.setattr(mod, 'write_text_atomic', picky)
+    result = run({'src_dir': str(src), 'out_dir': str(tmp_path / 'out')},
+                 RunContext())
+    assert result.failures == [('a.mjo', '写出失败: 文件名过长')]
+    assert not (tmp_path / 'out' / 'a.txt').exists()
+    assert (tmp_path / 'out' / 'b.txt').read_text(encoding='utf-8') == 'い'
+    assert str(tmp_path / MERGED_NAME) in result.output_paths
+    # 失败的那个既不该进合并全文，也不该计进条数
+    assert 'あ' not in (tmp_path / MERGED_NAME).read_text(encoding='utf-8')
+    assert '共提取 1 条文本' in result.summary
+
+
+def test_merged_write_failure_still_publishes_single_files(tmp_path, monkeypatch):
+    """合并全文写不出去时单文件仍算产出，旧的合并全文保持原样。"""
+    import galtools.tools.mjo_text as mod
+
+    src = tmp_path / 'src'
+    src.mkdir()
+    (src / 'a.mjo').write_bytes(build_mjo(show_text('あ')))
+    merged = tmp_path / MERGED_NAME
+    merged.write_text('旧全文', encoding='utf-8')
+    real_write = mod.write_text_atomic
+
+    def picky(path, text):
+        if os.path.basename(path) == MERGED_NAME:
+            raise OSError('盘满')
+        return real_write(path, text)
+
+    monkeypatch.setattr(mod, 'write_text_atomic', picky)
+    result = run({'src_dir': str(src), 'out_dir': str(tmp_path / 'out')},
+                 RunContext())
+    assert (tmp_path / 'out' / 'a.txt').exists()
+    assert merged.read_text(encoding='utf-8') == '旧全文'
+    assert result.output_paths == [str(tmp_path / 'out')]
+    assert result.failures == [(MERGED_NAME, '写出失败: 盘满')]
+    assert result.warnings
+
+
+def test_all_failed_leaves_no_empty_output_dir(tmp_path, monkeypatch):
+    import galtools.tools.mjo_text as mod
+
+    src = tmp_path / 'src'
+    src.mkdir()
+    (src / 'a.mjo').write_bytes(build_mjo(show_text('あ')))
+
+    def boom(_path, _text):
+        raise OSError('只读盘')
+
+    monkeypatch.setattr(mod, 'write_text_atomic', boom)
+    out = tmp_path / 'out'
+    result = run({'src_dir': str(src), 'out_dir': str(out)}, RunContext())
+    assert result.output_paths == []
+    assert not out.exists()
+
+
+def test_all_failed_keeps_a_pre_existing_output_dir(tmp_path, monkeypatch):
+    """rmdir 只清得掉本轮建的空目录；里面有旧成果时它自己失败，正是想要的。"""
+    import galtools.tools.mjo_text as mod
+
+    src = tmp_path / 'src'
+    src.mkdir()
+    (src / 'a.mjo').write_bytes(build_mjo(show_text('あ')))
+    out = tmp_path / 'out'
+    out.mkdir()
+    (out / '上一轮.txt').write_text('旧', encoding='utf-8')
+
+    def boom(_path, _text):
+        raise OSError('只读盘')
+
+    monkeypatch.setattr(mod, 'write_text_atomic', boom)
+    run({'src_dir': str(src), 'out_dir': str(out)}, RunContext())
+    assert (out / '上一轮.txt').read_text(encoding='utf-8') == '旧'
+
+
 def test_cancel_after_the_last_parse_does_not_publish_merged(tmp_path, monkeypatch):
     import galtools.tools.mjo_text as mod
 
