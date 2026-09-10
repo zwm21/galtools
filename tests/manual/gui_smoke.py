@@ -177,8 +177,8 @@ print('声优库 表格 可见=%s 标题=%r 表头=%r'
 for row in table_rows(viewer):
     print('   ', row)
 
-# 另外两个工具不给表格：切过去不该炸，也不该留着别人的表。
-for tool_id in ('mjo_text', 'audio_filter'):
+# 另外三个工具不给表格：切过去不该炸，也不该留着别人的表。
+for tool_id in ('mjo_text', 'audio_filter', 'file_collect'):
     select(again, tool_id)
     pump(1.0)
     other = again.pages[tool_id]

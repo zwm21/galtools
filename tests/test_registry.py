@@ -83,8 +83,8 @@ def test_sorted_by_category_then_name(tmp_path, monkeypatch):
 def test_real_tools_load_cleanly():
     tools, errors = discover()
     assert errors == []
-    assert {t.id for t in tools} == {'mjo_text', 'audio_filter', 'vndb_voiced',
-                                     'seiyuu_db'}
+    assert {t.id for t in tools} == {'mjo_text', 'audio_filter', 'file_collect',
+                                     'vndb_voiced', 'seiyuu_db'}
     for tool in tools:
         assert tool.name and tool.category and tool.description
         assert tool.fields and callable(tool.run)
