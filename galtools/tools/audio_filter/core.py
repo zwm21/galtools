@@ -8,7 +8,7 @@
     Ogg Vorbis : 首页 ID 头取采样率（\\x01vorbis 魔数后 +12 字节），
                  末页 EOS 的 granule position ÷ 采样率。
     Ogg Opus   : granule 恒按 48kHz 计，另减去 preskip。
-    WAV (PCM)  : 遍历 RIFF chunk，data 大小 ÷ 字节速率。
+    WAV        : 遍历 RIFF chunk，data 大小 ÷ 字节速率（见 PCM_FORMATS）。
 
 刻意保留的既有行为：
 - 命中按时长降序复制，unique_dest 的编号与清单顺序都依赖这个顺序。
@@ -33,6 +33,10 @@ DEFAULT_THRESHOLD = 6.0
 SUPPORTED_EXTS = {'.ogg', '.wav'}
 TAIL_WINDOW = 65536          # 从文件尾部反读的窗口大小（字节）
 MAX_SANE_DURATION = 120.0    # 超过该值视为解析异常（游戏语音不可能超过 2 分钟）
+
+# 认得的 fmt 块格式标签。0x0003(IEEE float) 与 0xFFFE(EXTENSIBLE) 的
+# wBitsPerSample 与 PCM 同义，data 大小 ÷ 字节速率照样成立。
+PCM_FORMATS = frozenset((0x0001, 0x0003, 0xFFFE))
 
 # 本工具输出目录的命名模式，递归扫描时只剔除完整匹配的自产目录。
 _NUM_PATTERN = r'(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
@@ -90,7 +94,7 @@ def parse_ogg_duration(path):
 
 
 def parse_wav_duration(path):
-    """返回 WAV(PCM) 文件时长（秒），无法解析返回 None。"""
+    """返回 WAV 文件时长（秒），无法解析返回 None。"""
     try:
         with open(path, 'rb') as fp:
             fp.seek(0, os.SEEK_END)
@@ -107,26 +111,26 @@ def parse_wav_duration(path):
                 ck = fp.read(8)
                 cid = ck[:4]
                 size = struct.unpack('<I', ck[4:])[0]
-                padded = size + (size & 1)
-                if size > file_size - fp.tell() or padded > file_size - fp.tell():
-                    return None
+                rest = file_size - fp.tell()
+                if size > rest:
+                    return None      # 声明长度超出物理文件，整份都不可信
+                # 奇数长度的块后面该有一个填充字节，但末块的那个常被省略。
+                # 只在文件真的到头时容忍，别把它和上面那种截断混为一谈。
+                skip = min(size + (size & 1), rest)
                 if cid == b'fmt ':
                     d = fp.read(size)
                     if len(d) < 16:
                         return None
-                    format_tag = struct.unpack('<H', d[:2])[0]
-                    channels = struct.unpack('<H', d[2:4])[0]
+                    format_tag, channels = struct.unpack('<HH', d[:4])
                     rate = struct.unpack('<I', d[4:8])[0]
                     bits = struct.unpack('<H', d[14:16])[0]
-                    if size & 1:
-                        fp.seek(1, os.SEEK_CUR)
-                elif cid == b'data':
-                    data_size = size
-                    fp.seek(padded, os.SEEK_CUR)
+                    fp.seek(skip - size, os.SEEK_CUR)
                 else:
-                    fp.seek(padded, os.SEEK_CUR)
-            if format_tag != 1 or not (rate and channels and bits
-                                       and data_size is not None):
+                    if cid == b'data':
+                        data_size = size
+                    fp.seek(skip, os.SEEK_CUR)
+            if format_tag not in PCM_FORMATS or not (
+                    rate and channels and bits and data_size is not None):
                 return None
             byte_rate = rate * channels * bits // 8
             if byte_rate == 0:

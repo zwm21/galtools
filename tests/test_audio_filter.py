@@ -31,13 +31,17 @@ def make_wav(path, seconds, rate=8000, channels=1, width=2):
 
 
 def wav_header(data_size, rate=8000, channels=1, bits=16, format_tag=1,
-               riff_size=None):
-    """生成物理 payload 完整的 WAV，可单独覆盖顶层 RIFF 声明长度。"""
+               riff_size=None, ext=b'', tail=b''):
+    """生成物理 payload 完整的 WAV，可单独覆盖顶层 RIFF 声明长度。
+
+    ext 接 fmt 块的扩展字段（EXTENSIBLE 用），tail 接 data 之后的额外块。
+    """
     fmt = struct.pack('<HHIIHH', format_tag, channels, rate,
-                      rate * channels * bits // 8, channels * bits // 8, bits)
+                      rate * channels * bits // 8, channels * bits // 8,
+                      bits) + ext
     payload = b'\x00' * data_size
     body = (b'WAVE' + b'fmt ' + struct.pack('<I', len(fmt)) + fmt
-            + b'data' + struct.pack('<I', data_size) + payload)
+            + b'data' + struct.pack('<I', data_size) + payload + tail)
     declared = len(body) if riff_size is None else riff_size
     return b'RIFF' + struct.pack('<I', declared) + body
 
@@ -88,12 +92,35 @@ def test_wav_rejects_non_riff(tmp_path):
     assert core.parse_wav_duration(write(tmp_path / 'a.wav', b'not a wav')) is None
 
 
-def test_wav_rejects_truncated_payload_and_non_pcm(tmp_path):
+def test_wav_rejects_truncated_payload(tmp_path):
+    """声明长度超出物理文件：整份不可信，不是「末块少个填充字节」。"""
     complete = wav_header(16000)
     assert core.parse_wav_duration(
         write(tmp_path / 'truncated.wav', complete[:-1])) is None
+
+
+def test_wav_accepts_float_and_extensible(tmp_path):
+    """0x0003 / 0xFFFE 的 wBitsPerSample 与 PCM 同义，时长公式照样成立。"""
+    float32 = wav_header(32000, bits=32, format_tag=3)
+    extensible = wav_header(16000, format_tag=0xFFFE,
+                            ext=struct.pack('<H', 22) + b'\x00' * 22)
     assert core.parse_wav_duration(
-        write(tmp_path / 'float.wav', wav_header(16000, format_tag=3))) is None
+        write(tmp_path / 'float.wav', float32)) == pytest.approx(1.0)
+    assert core.parse_wav_duration(
+        write(tmp_path / 'ext.wav', extensible)) == pytest.approx(1.0)
+
+
+def test_wav_rejects_unknown_format_tag(tmp_path):
+    assert core.parse_wav_duration(
+        write(tmp_path / 'adpcm.wav', wav_header(16000, format_tag=2))) is None
+
+
+def test_wav_tolerates_missing_pad_on_final_chunk(tmp_path):
+    """末块长度为奇数时那个 RIFF 填充字节常被省略，不该废掉整个文件。"""
+    tail = b'LIST' + struct.pack('<I', 3) + b'abc'
+    assert core.parse_wav_duration(
+        write(tmp_path / 'a.wav', wav_header(16000, tail=tail))
+    ) == pytest.approx(1.0)
 
 
 def test_wav_tolerates_wrong_top_level_riff_length(tmp_path):
