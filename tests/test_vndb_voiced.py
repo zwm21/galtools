@@ -612,6 +612,30 @@ def test_resolve_name_refuses_single_inexact_hit(monkeypatch):
     assert [c.sid for c in res.candidates] == ['s2']
 
 
+def test_resolve_name_stops_paging_and_refuses_when_results_overflow(monkeypatch):
+    """别名行太多时封顶翻页；没看完就不能声称精确匹配唯一，只能要 id。"""
+    pages = []
+
+    def handler(path, body, _nth):
+        filters = body.get('filters')
+        if filters == ['search', '=', 'Common Name']:
+            pages.append(body['page'])
+            rows = [{'id': 's%d' % (body['page'] * 1000 + i), 'aid': 'a%d' % i,
+                     'name': 'Common Name', 'original': ''}
+                    for i in range(api.PAGE_SIZE)]
+            return page(rows, more=True)
+        if filters and filters[0] == 'or':
+            return page([])
+        raise AssertionError((path, body))
+
+    FakeApi(handler).install(monkeypatch)
+    result = fetch.resolve_name('Common Name', api.Client())
+    assert pages == [1, 2, 3]
+    assert not result.ok and '超过 %d 条' % fetch.SEARCH_MAX_ROWS in result.error
+    assert '请改填其中一个 id' in result.error
+    assert len(result.candidates) == fetch.SEARCH_MAX_ROWS
+
+
 def test_resolve_name_not_found(monkeypatch):
     FakeApi(vndb()).install(monkeypatch)
     res = fetch.resolve_target('Nobody Here', api.Client())

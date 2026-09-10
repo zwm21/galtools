@@ -40,6 +40,11 @@ OTHER_ID_RE = re.compile(r'^([vcrpgiu])\d+$', re.IGNORECASE)
 OTHER_KINDS = {'v': '作品', 'c': '角色', 'r': '发行', 'p': '开发商',
                'g': '标签', 'i': '道具', 'u': '用户'}
 
+# 按名字搜人时最多翻的行数（3 页）。搜索命中的是别名行，一个常见姓氏能刷出几百
+# 行，而无上限地翻页要在 190 请求 / 5 分钟的配额里付掉十几次——只为了列出前几个
+# 候选。到顶就认输让用户填 id，见 resolve_name 里为什么不能只看前几页就选人。
+SEARCH_MAX_ROWS = api.PAGE_SIZE * 3
+
 
 def normalize(text):
     """比较与去重用的归一化：去掉全部空白后 casefold。
@@ -167,12 +172,19 @@ def resolve_name(target, client):
     Muryoukouji Kabutonosuke）和 s367（真正的小野涼子）。按第一条自动取会静默
     选错人，所以规则写死成：按 id 去重 → 归一化后与 name/original 精确相等的
     唯一候选才自动采用 → 否则列出全部候选（展示各 id 的主名）并拒绝启动。
+
+    「唯一」是对**全部**搜索结果说的，所以不能一找到精确匹配就停止翻页：第二个
+    同名者可能在下一页上，早退等于把该拒绝的情况变成静默选错人。反过来，行数撞到
+    SEARCH_MAX_ROWS 时也不能再自动采用——没看到的那些页里同样可能藏着同名者，
+    这时只能报错让用户改填 id。
     """
-    rows = list(client.paged('staff', {
-        'filters': ['search', '=', target], 'fields': STAFF_FIELDS,
-    }))
+    rows = list(itertools.islice(
+        client.paged('staff', {'filters': ['search', '=', target],
+                               'fields': STAFF_FIELDS}),
+        SEARCH_MAX_ROWS))
     if not rows:
         return Resolution(target=target, error='搜不到叫「%s」的人' % target)
+    truncated = len(rows) >= SEARCH_MAX_ROWS
 
     order, groups = [], {}
     for row in rows:
@@ -187,7 +199,7 @@ def resolve_name(target, client):
              if any(normalize(r.get('name')) == want
                     or normalize(r.get('original')) == want
                     for r in groups[sid])]
-    if len(exact) == 1:
+    if len(exact) == 1 and not truncated:
         staff = load_staff(exact[0], client)
         if staff is not None:
             return Resolution(target=target, staff=staff)
@@ -198,7 +210,10 @@ def resolve_name(target, client):
         name, original = names.get(sid) or (groups[sid][0].get('name') or '',
                                             groups[sid][0].get('original') or '')
         candidates.append(Candidate(sid=sid, name=name, original=original))
-    if len(candidates) == 1:
+    if truncated:
+        error = '「%s」命中的别名行超过 %d 条，没法确认是不是只有一个人' % (
+            target, SEARCH_MAX_ROWS)
+    elif len(candidates) == 1:
         error = '「%s」只命中一个人，但名字不完全相同' % target
     else:
         error = '「%s」命中 %d 个人' % (target, len(candidates))
