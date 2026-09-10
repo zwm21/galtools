@@ -18,9 +18,11 @@ from .model import Credit, Staff, StaffCredits
 
 SCHEMA = 1
 
-# 文件名即身份，且要拼进路径，所以 sid 只认 vndb 那一种形状。
+# 文件名即身份，且要拼进路径，所以 sid 只认 vndb 那一种形状。大小写也要认死：
+# 带 IGNORECASE 时 `S1.json` 算人物文件，得靠 lower() 掰回 SID_RE 的形状，而
+# path_for 写回去的是 `s1.json`——在大小写敏感的文件系统上就成了同一个人两份文件。
 SID_RE = re.compile(r'^s\d+$')
-NAME_RE = re.compile(r'^s\d+\.json$', re.IGNORECASE)
+NAME_RE = re.compile(r'^s\d+\.json$')
 
 # 逐条落盘的字段，与 model.Credit 的字段同名。刻意写成常量而不是从
 # dataclasses.fields 现推：给 Credit 加字段就该顺手决定库格式要不要跟着变，
@@ -51,10 +53,9 @@ class Person:
 
 def sid_from_path(path):
     """从库文件名取得身份；只有 `s<id>.json` 才是人物文件。"""
-    match = NAME_RE.match(os.path.basename(path or ''))
-    if not match:
+    if not NAME_RE.match(os.path.basename(path or '')):
         return ''
-    return os.path.splitext(os.path.basename(path))[0].lower()
+    return os.path.splitext(os.path.basename(path))[0]
 
 
 def path_for(db_dir, sid):

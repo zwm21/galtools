@@ -165,35 +165,44 @@ def scan_audio_files(src, recursive, ctx=None):
     """返回 (解析成功列表[(路径, 时长, 大小)], 解析失败列表[路径], 音频文件总数)。
 
     ctx 为 None 时不报进度也不响应取消，与命令行版行为一致。
+
+    非递归那一支顺手带上 scandir 已经缓存的大小，省掉每个文件一次 stat；
+    os.walk 不产出 DirEntry，递归那一支只能填 None 回落到 os.path.getsize。
     """
-    paths = []
+    entries = []
     if recursive:
         for root, dirs, files in os.walk(src):
             dirs[:] = [d for d in dirs if not OUT_DIR_PATTERN.fullmatch(d)]
             for name in files:
-                paths.append(os.path.join(root, name))
+                entries.append((os.path.join(root, name), None))
     else:
         with os.scandir(src) as it:
             for e in it:
                 if e.is_file():
-                    paths.append(e.path)
+                    try:
+                        size = e.stat().st_size
+                    except OSError:
+                        size = None
+                    entries.append((e.path, size))
 
-    targets = [p for p in paths
-               if os.path.splitext(p)[1].lower() in SUPPORTED_EXTS]
+    targets = [item for item in entries
+               if os.path.splitext(item[0])[1].lower() in SUPPORTED_EXTS]
     audio, failed = [], []
     total = len(targets)
-    for idx, p in enumerate(targets, 1):
+    for idx, (p, known_size) in enumerate(targets, 1):
         if ctx is not None:
             ctx.check_cancel()
         d = get_duration(p)
         if d is None:
             failed.append(p)
         else:
-            try:
-                size = os.path.getsize(p)
-            except OSError:
-                failed.append(p)
-                continue
+            size = known_size
+            if size is None:
+                try:
+                    size = os.path.getsize(p)
+                except OSError:
+                    failed.append(p)
+                    continue
             audio.append((p, d, size))
         if ctx is not None:
             ctx.progress(idx, total, '解析时长 %d/%d' % (idx, total))

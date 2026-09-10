@@ -126,6 +126,17 @@ def test_person_key_uses_the_file_name_as_identity():
     assert update.person_key(person) == 's42'
 
 
+def test_library_file_names_are_case_sensitive():
+    """`S42.json` 不算人物文件。
+
+    认小写以外的写法就得靠 lower() 把 sid 掰回形状，而写回去的是
+    path_for 的 `s42.json`——大小写敏感的文件系统上会变成同一个人两份文件。
+    """
+    assert store.sid_from_path(os.path.join('lib', 's42.json')) == 's42'
+    assert store.sid_from_path(os.path.join('lib', 'S42.json')) == ''
+    assert store.sid_from_path(os.path.join('lib', 'note.txt')) == ''
+
+
 def test_update_table_lists_counts_and_status():
     people = [make_person(sid='s1', credits=[make_credit()]),
               make_person(sid='s2', credits=[make_credit()])]

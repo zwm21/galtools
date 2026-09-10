@@ -101,6 +101,9 @@ class JobRunner:
 
     @property
     def state(self):
+        # 生产代码只看 busy/kind；这个更细的生命周期字段
+        # （idle/preview/run/cancelling/closing）是留给 test_gui 的可观测面，
+        # 用来断言取消与关闭途中的中间态，busy 和 kind 表达不了。
         return self._state
 
     @property
