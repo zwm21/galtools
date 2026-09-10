@@ -240,15 +240,24 @@ def test_update_all_rewrites_a_person_with_new_credits(monkeypatch, tmp_path):
         'released': '2026-01-01',
         'va': [{'staff': {'id': 's1', 'aid': 'a1'},
                 'character': {'id': 'c9'}, 'note': ''}]})
-    ctx = RunContext()
+    ctx = RecordingContext()
     got = tool.preview(update_params(tmp_path), ctx)
     assert '有变化 1' in got.summary
     assert 'Game Three' in got.summary          # 新增作品直接点名
+    log_count = len(ctx.logs)
     result = tool.run(update_params(tmp_path), ctx)
     assert '更新 1 人' in result.summary
     new = (tmp_path / 's1.json').read_text(encoding='utf-8')
     assert 'Game Three' in new and '2020-01-01' not in new
     assert len(store.read_person(str(tmp_path), 's1').credits) == 3
+    run_messages = [message for _level, message in ctx.logs[log_count:]]
+    assert '开始写回本地库：待写 1 人。' in run_messages
+    assert any(message.startswith('已写入本地库：') for message in run_messages)
+    assert run_messages[-1] == '本地库写回完成：成功 1 人，失败 0 人。'
+    write_progress = [call for call in ctx.progress_calls
+                      if '正在写回本地库' in call[2]]
+    assert len(write_progress) == 1
+    assert write_progress[0][:2] == (1, 1)
 
 
 def test_update_all_run_reuses_the_preview_fetch(monkeypatch, tmp_path):
@@ -297,6 +306,28 @@ def test_update_all_checks_cancel_before_each_write(monkeypatch, tmp_path):
         tool_impl._run_update(update_params(tmp_path), CancelSecond())
     assert store.read_person(str(tmp_path), 's1').staff.name.endswith(' New')
     assert not store.read_person(str(tmp_path), 's2').staff.name.endswith(' New')
+
+
+def test_update_all_reports_a_failed_write_without_success(monkeypatch, tmp_path):
+    seed_library(monkeypatch, tmp_path, 's1')
+    old = store.read_person(str(tmp_path), 's1')
+    fresh = make_fresh(sid='s1', name=old.staff.name + ' New',
+                       original=old.staff.original, credits=old.credits)
+    entries = update.build_entries([old], {'s1': fresh}, {})
+    monkeypatch.setattr(tool_impl, '_update_batch',
+                        lambda _params, _ctx: (entries, [], ''))
+    monkeypatch.setattr(store, 'write_person',
+                        lambda _db_dir, _item: (_ for _ in ()).throw(
+                            OSError('disk full')))
+    ctx = RecordingContext()
+
+    result = tool_impl._run_update(update_params(tmp_path), ctx)
+
+    messages = [message for _level, message in ctx.logs]
+    assert any('没写进本地库：disk full' in message for message in messages)
+    assert not any(message.startswith('已写入本地库：') for message in messages)
+    assert messages[-1] == '本地库写回完成：成功 0 人，失败 1 人。'
+    assert result.failures and result.output_paths == []
 
 
 def test_update_all_never_replaces_a_person_with_zero_credits(monkeypatch,

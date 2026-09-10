@@ -290,6 +290,12 @@ def _run_update(params, ctx):
     db_dir = params.get('db_dir')
     lines = ['\n========== 更新结果 ==========']
     failures, written = [], []
+    changed = update.counts(entries)[0]
+    if changed:
+        ctx.log('开始写回本地库：待写 %d 人。' % changed)
+    else:
+        ctx.log('写回本地库：有变化 0 人，无需写入。')
+    write_index = 0
     for entry in entries:
         label = entry.person.staff.label() or update.person_key(entry.person)
         if entry.status == update.FAILED:
@@ -299,15 +305,23 @@ def _run_update(params, ctx):
         elif entry.status == update.CHANGED:
             try:
                 ctx.check_cancel()
+                write_index += 1
+                ctx.progress(write_index, changed,
+                             '正在写回本地库 %d/%d：%s'
+                             % (write_index, changed, label))
                 store.write_person(db_dir, entry.fresh)
             except (store.BadFile, OSError) as e:
                 ctx.log('%s 没写进本地库：%s' % (label, e), 'warn')
                 failures.append((label, str(e)))
             else:
                 written.append(entry)
+                ctx.log('已写入本地库：%s' % label)
                 lines.append('%s : %d → %d（+%d/-%d）' % (
                     label, len(entry.person.credits), len(entry.fresh.credits),
                     len(entry.added), len(entry.removed)))
+    if changed:
+        ctx.log('本地库写回完成：成功 %d 人，失败 %d 人。'
+                % (len(written), changed - len(written)))
     lines.append('更新 %d 人 / %s' % (len(written), update.summary_line(entries)))
     warnings = []
     if broken:
