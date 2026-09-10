@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.paths import keep_drive_root
-from ..core.spec import BOOL, DIR, NUMBER, TEXT
+from ..core.spec import BOOL, DIR, FILE, NUMBER, TEXT
 
 HISTORY_LIMIT = 5
 
@@ -95,6 +95,55 @@ def _build_dir(spec_field):
     return row, edit, edit.currentTextChanged, lambda: normalize_path(edit.currentText())
 
 
+class FileEdit(HistoryEdit):
+    """单文件路径输入；拖入文件时保留文件本身。"""
+
+    def __init__(self, placeholder=''):
+        super().__init__(placeholder)
+        self.setAcceptDrops(True)
+        self.lineEdit().setAcceptDrops(False)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        path = urls[0].toLocalFile()
+        if path and os.path.isfile(path):
+            self.setCurrentText(path)
+            event.acceptProposedAction()
+
+
+def _build_file(spec_field):
+    edit = FileEdit(spec_field.placeholder)
+    if spec_field.default is not None:
+        edit.setCurrentText(str(spec_field.default))
+    browse = QPushButton('浏览…')
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(edit, 1)
+    layout.addWidget(browse)
+
+    def pick():
+        current = normalize_path(edit.currentText())
+        start = current if os.path.isdir(current) else os.path.dirname(current)
+        chosen, _filter = QFileDialog.getOpenFileName(
+            row, spec_field.label, start or '', '所有文件 (*)')
+        if chosen:
+            edit.setCurrentText(os.path.normpath(chosen))
+
+    browse.clicked.connect(pick)
+    return row, edit, edit.currentTextChanged, lambda: normalize_path(edit.currentText())
+
+
 def _build_bool(spec_field):
     box = QCheckBox()
     box.setChecked(bool(spec_field.default))
@@ -126,8 +175,8 @@ def _build_text(spec_field):
 
 
 def _keeps_history(spec_field):
-    """哪些字段要记「最近用过」：目录一律记，别的看 Field.history。"""
-    return spec_field.kind == DIR or spec_field.history
+    """哪些字段要记「最近用过」：路径一律记，别的看 Field.history。"""
+    return spec_field.kind in (DIR, FILE) or spec_field.history
 
 
 def _fmt_default(value):
@@ -139,6 +188,7 @@ def _fmt_default(value):
 # kind -> 构造函数，返回 (放进布局的控件, 焦点控件, 变更信号, 取值函数)
 _BUILDERS = {
     DIR: _build_dir,
+    FILE: _build_file,
     BOOL: _build_bool,
     NUMBER: _build_number,
     TEXT: _build_text,

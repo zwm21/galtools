@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 DIR = 'dir'
+FILE = 'file'
 BOOL = 'bool'
 NUMBER = 'number'
 TEXT = 'text'

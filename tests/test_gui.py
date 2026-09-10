@@ -24,10 +24,11 @@ from PySide6.QtWidgets import QApplication                     # noqa: E402
 
 from galtools.core.context import Cancelled                    # noqa: E402
 from galtools.core.spec import (                                # noqa: E402
-    TEXT, Field, PreviewResult, RunResult, Table, ToolSpec,
+    FILE, TEXT, Field, PreviewResult, RunResult, Table, ToolSpec,
 )
+from galtools.gui import form as form_module                    # noqa: E402
 from galtools.gui import main_window as mw                     # noqa: E402
-from galtools.gui.form import normalize_path                   # noqa: E402
+from galtools.gui.form import ToolForm, normalize_path         # noqa: E402
 from galtools.gui.worker import Bridge, JobRunner              # noqa: E402
 
 
@@ -436,6 +437,48 @@ def test_stale_main_window_events_are_all_ignored(qt_app, monkeypatch, tmp_path)
     finally:
         win._run_token = 0
         win.close()
+
+
+# ---------------- 单文件字段 ----------------
+def test_file_field_uses_full_path_and_history(qt_app, tmp_path):
+    feature = tmp_path / 'voice_chika.ogg'
+    feature.write_bytes(b'ogg')
+    settings = QSettings(str(tmp_path / 'file.ini'), QSettings.IniFormat)
+    spec = ToolSpec(
+        id='file_field', name='文件字段', category='测试', description='',
+        fields=(Field(key='feature', kind=FILE, label='特征文件'),),
+        run=lambda _params, _ctx: RunResult())
+
+    form = ToolForm(spec, settings)
+    try:
+        form._editors['feature'].setCurrentText('  "%s"  ' % feature)
+        assert form.values()['feature'] == str(feature)
+        assert form.missing_required_keys() == []
+        form.remember_paths()
+        assert settings.value(form._history_key('feature')) == [str(feature)]
+    finally:
+        form.close()
+
+
+def test_file_field_browse_keeps_selected_file(qt_app, monkeypatch, tmp_path):
+    feature = tmp_path / 'sample.txt'
+    feature.write_text('x', encoding='utf-8')
+    monkeypatch.setattr(
+        form_module.QFileDialog, 'getOpenFileName',
+        lambda *_args: (str(feature), '所有文件 (*)'))
+    settings = QSettings(str(tmp_path / 'browse.ini'), QSettings.IniFormat)
+    spec = ToolSpec(
+        id='file_browse', name='文件浏览', category='测试', description='',
+        fields=(Field(key='feature', kind=FILE, label='特征文件'),),
+        run=lambda _params, _ctx: RunResult())
+
+    form = ToolForm(spec, settings)
+    try:
+        container = form._containers['feature']
+        container.findChild(form_module.QPushButton).click()
+        assert form.values()['feature'] == str(feature)
+    finally:
+        form.close()
 
 
 # ---------------- 路径 ----------------
