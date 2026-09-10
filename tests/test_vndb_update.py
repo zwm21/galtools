@@ -180,16 +180,44 @@ def seed_library(monkeypatch, tmp_path, *sids):
     return {sid: (tmp_path / f'{sid}.json').read_bytes() for sid in sids}
 
 
+class RecordingContext(RunContext):
+    def __init__(self):
+        super().__init__()
+        self.logs = []
+        self.progress_calls = []
+
+    def log(self, msg, level='info'):
+        self.logs.append((level, msg))
+
+    def progress(self, done, total, note=''):
+        self.progress_calls.append((done, total, note))
+
+
 def test_update_all_preview_compares_with_the_library(monkeypatch, tmp_path):
     seed_library(monkeypatch, tmp_path, 's1', 's2')
     # 一个坏文件只进 warnings，不拖垮整批
     (tmp_path / 's3.json').write_text('{oops', encoding='utf-8')
-    got = tool.preview(update_params(tmp_path), RunContext())
+    ctx = RecordingContext()
+    got = tool.preview(update_params(tmp_path), ctx)
     assert got.ok
     assert '库内 2 人' in got.summary and '无变化 2' in got.summary
     assert any('s3.json' in w for w in got.warnings)
     assert got.table.title == '有变化 0 / 无变化 2 / 0 条保护 0 / 失败 0'
     assert [row[2][0] for row in got.table.rows] == ['s1', 's2']
+
+    messages = [message for _level, message in ctx.logs]
+    assert any('人物文件 3 个，有效 2 人，坏文件 1 个' in message
+               for message in messages)
+    assert messages.index('开始确认 VNDB 主页：共 2 人。') < messages.index(
+        'VNDB 主页确认完成：成功 2 人，失败 0 人；接下来处理 2 人的出演记录。')
+    assert messages[-1] == (
+        '本地比对完成：有变化 0 / 无变化 2 / 0 条保护 0 / 失败 0。')
+    homepage_progress = [call for call in ctx.progress_calls
+                         if '确认 VNDB 主页' in call[2]]
+    assert homepage_progress == [
+        (1, 2, '正在确认 VNDB 主页 1/2：s1'),
+        (2, 2, '正在确认 VNDB 主页 2/2：s2'),
+    ]
 
 
 def test_update_all_skips_files_without_changes(monkeypatch, tmp_path):
@@ -226,12 +254,22 @@ def test_update_all_rewrites_a_person_with_new_credits(monkeypatch, tmp_path):
 def test_update_all_run_reuses_the_preview_fetch(monkeypatch, tmp_path):
     seed_library(monkeypatch, tmp_path, 's1', 's2')
     fake = online.FakeApi(online.vndb()).install(monkeypatch)
-    ctx = RunContext()
+    ctx = RecordingContext()
     tool.preview(update_params(tmp_path), ctx)
     calls = len(fake.calls)
+    log_count = len(ctx.logs)
     assert calls > 0
     tool.run(update_params(tmp_path), ctx)
     assert len(fake.calls) == calls             # run 零请求，全走缓存
+    run_messages = [message for _level, message in ctx.logs[log_count:]]
+    assert any('VNDB 主页确认：复用本次查询结果' in message
+               for message in run_messages)
+    assert any('出演记录：复用本次查询结果' in message
+               for message in run_messages)
+    assert not any(message.startswith('开始确认 VNDB 主页')
+                   for message in run_messages)
+    assert not any(message.startswith('开始处理出演记录')
+                   for message in run_messages)
 
 
 def test_update_all_checks_cancel_before_each_write(monkeypatch, tmp_path):
@@ -332,12 +370,17 @@ def test_cli_update_all_requires_db_and_refuses_targets(monkeypatch, tmp_path):
         assert caught.value.code == 2
 
 
-def test_cli_update_all_runs_the_update_pipeline(monkeypatch, tmp_path):
+def test_cli_update_all_runs_the_update_pipeline(monkeypatch, tmp_path, capsys):
     before = seed_library(monkeypatch, tmp_path, 's1', 's2')
     online.FakeApi(online.vndb()).install(monkeypatch)
     monkeypatch.setattr(cli.sys, 'argv',
                         ['cli', '--update-all', '--db', str(tmp_path)])
     assert cli.main() == 0                        # 全部已是最新算成功
+    captured = capsys.readouterr()
+    assert '人物文件 2 个，有效 2 人，坏文件 0 个' in captured.out
+    assert '正在确认 VNDB 主页 1/2：s1' in captured.out
+    assert '正在确认 VNDB 主页 2/2：s2' in captured.out
+    assert '本地比对完成：有变化 0 / 无变化 2 / 0 条保护 0 / 失败 0' in captured.out
     for sid, data in before.items():
         assert (tmp_path / f'{sid}.json').read_bytes() == data
     # 库目录必须已存在，这条与 GUI 是同一份 validate

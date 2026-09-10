@@ -157,26 +157,38 @@ def _update_batch(params, ctx):
     preview 与 run 共用这一条管线：抓取走 ensure_credits 的会话缓存，run 命中
     缓存时零请求。fatal 非空表示库目录本身读不了，entries 为 None。
     """
+    ctx.log('更新全库：正在读取本地库…')
     try:
         people, broken = store.read_all(params.get('db_dir'))
     except store.BadFile as e:
+        ctx.log('本地库读取失败：%s' % e, 'warn')
         return None, [], str(e)
+    file_count = len(people) + len(broken)
     if not people:
+        ctx.log('本地库读取完成：人物文件 %d 个，有效 0 人，坏文件 %d 个；'
+                '没有可更新的人。' % (file_count, len(broken)))
         return [], broken, ''
+    ctx.log('本地库读取完成：人物文件 %d 个，有效 %d 人，坏文件 %d 个；'
+            '接下来确认 %d 人的 VNDB 主页。'
+            % (file_count, len(people), len(broken), len(people)))
 
     client = api.Client(ctx)
     key = tuple(update.person_key(person) for person in people)
     cached = ctx.session.get(UPDATE_STAFFS_KEY)
     if cached is not None and cached[0] == key:
         staffs, errors = cached[1], {}
+        ctx.log('VNDB 主页确认：复用本次查询结果，共 %d 人；不重复请求。'
+                % len(staffs))
     else:
         staffs, errors = [], {}
         total = len(people)
-        for i, person in enumerate(people):
+        ctx.log('开始确认 VNDB 主页：共 %d 人。' % total)
+        for current, person in enumerate(people, 1):
             # list_files 只认 s<id>.json，person_key 在这里总能拿到合法 sid：
             # 文件内容里的 sid 坏了也能从文件名救回来，写完顺手把它治愈。
-            sid = key[i]
-            ctx.progress(i, total, '正在确认 %s 的 vndb 主页…' % sid)
+            sid = key[current - 1]
+            ctx.progress(current, total, '正在确认 VNDB 主页 %d/%d：%s'
+                         % (current, total, sid))
             try:
                 staff = fetch.load_staff(sid, client)
             except api.ApiError as e:
@@ -186,17 +198,36 @@ def _update_batch(params, ctx):
                 errors[sid] = 'vndb 上已经没有 %s 这个人' % sid
                 continue
             staffs.append(staff)
+        ctx.log('VNDB 主页确认完成：成功 %d 人，失败 %d 人；'
+                '接下来处理 %d 人的出演记录。'
+                % (len(staffs), len(errors), len(staffs)))
         if not errors:
             # 与 ensure_credits 同一口径：抖一次网造成的残缺名单不缓存，
             # 否则用户再点一次「查询」拿回的仍是同一份残缺。
             ctx.check_cancel()
             ctx.session[UPDATE_STAFFS_KEY] = (key, staffs)
+    credit_key = tuple(staff.sid for staff in staffs)
+    credit_cache = ctx.session.get('credits')
+    credits_cached = credit_cache is not None and credit_cache[0] == credit_key
+    if not staffs:
+        ctx.log('没有通过 VNDB 主页确认的人，跳过出演记录处理；'
+                '接下来与本地库比对。')
+    elif credits_cached:
+        ctx.log('出演记录：复用本次查询结果，共 %d 人；不重复抓取；'
+                '接下来与本地库比对。' % len(credit_cache[1][0]))
+    else:
+        ctx.log('开始处理出演记录：共 %d 人。' % len(staffs))
     items, hard = fetch.ensure_credits(staffs, ctx, client)
+    if staffs and not credits_cached:
+        ctx.log('出演记录处理完成：成功 %d 人，失败 %d 人；'
+                '接下来与本地库比对。' % (len(items), len(hard)))
     by_label = {staff.label(): staff.sid for staff in staffs}
     for lbl, reason in hard:
         errors[by_label.get(lbl, lbl)] = reason
     fresh = {item.staff.sid: item for item in items}
-    return update.build_entries(people, fresh, errors), broken, ''
+    entries = update.build_entries(people, fresh, errors)
+    ctx.log('本地比对完成：%s。' % update.summary_line(entries))
+    return entries, broken, ''
 
 
 def _preview_update(params, ctx):
