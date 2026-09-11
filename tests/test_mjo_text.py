@@ -438,7 +438,7 @@ def test_all_failed_leaves_no_empty_output_dir(tmp_path, monkeypatch):
 
 
 def test_all_failed_keeps_a_pre_existing_output_dir(tmp_path, monkeypatch):
-    """rmdir 只清得掉本轮建的空目录；里面有旧成果时它自己失败，正是想要的。"""
+    """非空的输出目录留着：rmdir 删不掉它，里面是上一轮的成果。"""
     import galtools.tools.mjo_text as mod
 
     src = tmp_path / 'src'
@@ -454,6 +454,28 @@ def test_all_failed_keeps_a_pre_existing_output_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, 'write_text_atomic', boom)
     run({'src_dir': str(src), 'out_dir': str(out)}, RunContext())
     assert (out / '上一轮.txt').read_text(encoding='utf-8') == '旧'
+
+
+def test_all_failed_keeps_a_pre_existing_empty_output_dir(tmp_path, monkeypatch):
+    """空的输出目录只要不是本轮建的就得留着——那是用户先建好的。
+
+    光靠「rmdir 删不掉非空目录」兜不住这条：目录空着的时候它删得掉。
+    """
+    import galtools.tools.mjo_text as mod
+
+    src = tmp_path / 'src'
+    src.mkdir()
+    (src / 'a.mjo').write_bytes(build_mjo(show_text('あ')))
+    out = tmp_path / 'out'
+    out.mkdir()
+
+    def boom(_path, _text):
+        raise OSError('只读盘')
+
+    monkeypatch.setattr(mod, 'write_text_atomic', boom)
+    result = run({'src_dir': str(src), 'out_dir': str(out)}, RunContext())
+    assert out.is_dir()
+    assert result.output_paths == []
 
 
 def test_cancel_after_the_last_parse_does_not_publish_merged(tmp_path, monkeypatch):

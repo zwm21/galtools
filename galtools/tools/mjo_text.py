@@ -250,6 +250,9 @@ def run(params, ctx):
         # 'w' 会把它清成空文件。GUI 靠 preview 的 ok=False 挡住这种情况，命令行
         # 直接调 run，没有那道闸。
         return RunResult(summary='%s 里没有 .mjo 文件，什么都没做。' % src_dir)
+    # 这一轮建没建过 out_dir，决定全失败时能不能把它清掉：用户预先建好的目录
+    # 不该因为我们一个文件都没写成就消失，哪怕它当时是空的。
+    out_dir_existed = os.path.isdir(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     total_lines = 0
@@ -287,12 +290,14 @@ def run(params, ctx):
         raise
 
     if not succeeded:
-        # 这一轮什么都没写进去，out_dir 又可能是刚建的。rmdir 只删得掉空目录，
-        # 里面有旧成果时它自己会失败，正好是想要的语义。
-        try:
-            os.rmdir(out_dir)
-        except OSError:
-            pass
+        # 这一轮什么都没写进去，只清本轮新建的那个空目录。rmdir 删不掉非空目录，
+        # 所以它还兼着「里面有旧成果就留着」这一层；但光靠这层不够——预先存在的
+        # 空目录同样会被它删掉，那是用户的东西。
+        if not out_dir_existed:
+            try:
+                os.rmdir(out_dir)
+            except OSError:
+                pass
         parts = ['处理 %d 个 mjo，成功 0 个，合并全文未改动' % len(files),
                  '失败列表:']
         parts.extend('  %s: %s' % (n, e) for n, e in failed)
