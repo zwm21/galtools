@@ -27,11 +27,6 @@ def _canonical(path):
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
-def _path_key(path):
-    """目标名冲突在 Windows 上按大小写不敏感处理。"""
-    return _canonical(path).casefold() if os.name == 'nt' else _canonical(path)
-
-
 def _is_within(path, parent):
     try:
         return os.path.commonpath((_canonical(path), _canonical(parent))) == _canonical(parent)
@@ -132,24 +127,50 @@ def select_hits(files, needle, case_sensitive):
             if name_matches(path, needle, case_sensitive)]
 
 
-def unique_destination(path, reserved=None):
-    reserved = reserved or set()
+def unique_destination(path):
+    """目标已存在就追加序号。单发用途：整批规划走 plan_destinations。"""
     candidate = path
     stem, ext = os.path.splitext(path)
     index = 1
-    while _path_key(candidate) in reserved or os.path.exists(candidate):
+    while os.path.exists(candidate):
         candidate = '%s_%d%s' % (stem, index, ext)
         index += 1
     return candidate
 
 
 def plan_destinations(hits, dst):
-    reserved = set()
+    """整批规划目标名：彼此之间、以及与 dst 已有文件都不撞名。
+
+    全部目标共用 dst 这一个父目录，判重因此只需比文件名，不必对每个候选做一次
+    realpath——那在 Windows 上是一次开文件的系统调用。dst 里原有什么开头列一次
+    就够：列完之后才出现的文件由 copy_hits 撞 FileExistsError 时重新编号兜住。
+
+    每个基名还要记住上次落到第几号，否则 k 个重名得探 k(k+1)/2 次。这不是理论
+    上的坏情况——解包目录里同一个 voice.ogg 散在上百个子目录下是常态，5000 个
+    文件 / 50 个基名实测是 40 秒与 0.03 秒的差别，而 preview 每次都要算一遍。
+    """
+    try:
+        taken = {os.path.normcase(name) for name in os.listdir(dst)}
+    except OSError:
+        # 列不动的目标目录同样让每个 mkstemp 失败，那些会按单文件记入 failures，
+        # 与这里抛出去掀掉整轮相比是想要的那种。
+        taken = set()
+    next_index = {}
     planned = []
     for source, size in hits:
-        target = unique_destination(os.path.join(dst, os.path.basename(source)), reserved)
-        reserved.add(_path_key(target))
-        planned.append((source, target, size))
+        base = os.path.basename(source)
+        stem, ext = os.path.splitext(base)
+        key = os.path.normcase(base)
+        # 从上次用过的号起跳是安全的：中间那些号要么被同基名的前一个命中占了，
+        # 要么当时就因为已被占用而跳过，两种情况都已经在 taken 里。
+        index = next_index.get(key, 0)
+        name = base
+        while os.path.normcase(name) in taken:
+            index += 1
+            name = '%s_%d%s' % (stem, index, ext)
+        next_index[key] = index
+        taken.add(os.path.normcase(name))
+        planned.append((source, os.path.join(dst, name), size))
     return planned
 
 

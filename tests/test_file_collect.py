@@ -156,6 +156,63 @@ def test_plan_destinations_is_stable_and_never_overwrites(tmp_path):
         'voice_1.ogg', 'voice_2.ogg']
 
 
+def test_plan_destinations_skips_numbers_claimed_by_other_hits(tmp_path):
+    """同基名从上次的号起跳，但撞上别的命中已占的号时仍要继续让路。"""
+    dst = tmp_path / 'dst'
+    dst.mkdir()
+    hits = [(str(tmp_path / 'a' / 'voice.ogg'), 1),
+            (str(tmp_path / 'b' / 'voice_1.ogg'), 1),
+            (str(tmp_path / 'c' / 'voice.ogg'), 1),
+            (str(tmp_path / 'd' / 'voice.ogg'), 1)]
+    planned = tool.plan_destinations(hits, str(dst))
+    assert [os.path.basename(target) for _source, target, _size in planned] == [
+        'voice.ogg', 'voice_1.ogg', 'voice_2.ogg', 'voice_3.ogg']
+
+
+def test_plan_destinations_only_lists_the_target_once(tmp_path, monkeypatch):
+    """规划整批只列一次目标目录，不对每个候选名做一次系统调用。
+
+    退回「逐个候选 exists + realpath」的写法时重名一多就是平方级：5000 个文件 /
+    50 个基名实测 40 秒对 0.03 秒，而这段规划每次预览都要重跑一遍。
+    """
+    dst = tmp_path / 'dst'
+    dst.mkdir()
+    (dst / 'voice.ogg').write_bytes(b'old')
+    listed = []
+    real_listdir = tool.os.listdir
+
+    def counting_listdir(path):
+        listed.append(path)
+        return real_listdir(path)
+
+    def forbidden(path, *_args, **_kwargs):
+        raise AssertionError('不该逐个探测文件系统：%s' % path)
+
+    monkeypatch.setattr(tool.os, 'listdir', counting_listdir)
+    monkeypatch.setattr(tool.os.path, 'exists', forbidden)
+    monkeypatch.setattr(tool.os.path, 'realpath', forbidden)
+
+    hits = [(str(tmp_path / ('d%d' % i) / 'voice.ogg'), 1) for i in range(400)]
+    planned = tool.plan_destinations(hits, str(dst))
+    assert listed == [str(dst)]
+    assert [os.path.basename(target) for _source, target, _size in planned] == [
+        'voice_%d.ogg' % i for i in range(1, 401)]
+
+
+def test_plan_destinations_survives_an_unlistable_target(tmp_path, monkeypatch):
+    """列不动目标目录也照旧规划：失败按单文件记在 copy_hits，不掀掉整轮。"""
+    dst = tmp_path / 'dst'
+    dst.mkdir()
+
+    def denied(_path):
+        raise OSError('denied')
+
+    monkeypatch.setattr(tool.os, 'listdir', denied)
+    source = str(tmp_path / 'a' / 'voice.ogg')
+    assert tool.plan_destinations([(source, 1)], str(dst)) == [
+        (source, str(dst / 'voice.ogg'), 1)]
+
+
 def test_atomic_copy_cleans_temporary_and_preserves_existing_target(tmp_path,
                                                                     monkeypatch):
     src = tmp_path / 'source.ogg'
