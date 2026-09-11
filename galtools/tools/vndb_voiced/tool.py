@@ -206,19 +206,18 @@ def _update_batch(params, ctx):
             # 否则用户再点一次「查询」拿回的仍是同一份残缺。
             ctx.check_cancel()
             ctx.session[UPDATE_STAFFS_KEY] = (key, staffs)
-    credit_key = tuple(staff.sid for staff in staffs)
-    credit_cache = ctx.session.get('credits')
-    credits_cached = credit_cache is not None and credit_cache[0] == credit_key
+    reusing_credits = fetch.credits_cached(staffs, ctx)
     if not staffs:
         ctx.log('没有通过 VNDB 主页确认的人，跳过出演记录处理；'
                 '接下来与本地库比对。')
-    elif credits_cached:
+    elif reusing_credits:
+        # 缓存只在一个人都没失败时才写，命中即等于这批人都在里面。
         ctx.log('出演记录：复用本次查询结果，共 %d 人；不重复抓取；'
-                '接下来与本地库比对。' % len(credit_cache[1][0]))
+                '接下来与本地库比对。' % len(staffs))
     else:
         ctx.log('开始处理出演记录：共 %d 人。' % len(staffs))
     items, hard = fetch.ensure_credits(staffs, ctx, client)
-    if staffs and not credits_cached:
+    if staffs and not reusing_credits:
         ctx.log('出演记录处理完成：成功 %d 人，失败 %d 人；'
                 '接下来与本地库比对。' % (len(items), len(hard)))
     by_label = {staff.label(): staff.sid for staff in staffs}

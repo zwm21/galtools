@@ -281,6 +281,45 @@ def test_update_all_run_reuses_the_preview_fetch(monkeypatch, tmp_path):
                    for message in run_messages)
 
 
+def test_credits_cached_reports_exactly_when_ensure_credits_reuses(monkeypatch):
+    """credits_cached 与 ensure_credits 必须对同一批人给出同一个答案。
+
+    它俩共用一份 key 推导和同一个 session 名字；分开写的话，改了抓取那边、
+    判断这边不跟着改，日志就会说「复用」而实际又发了一轮请求。
+    """
+    fake = online.FakeApi(online.vndb()).install(monkeypatch)
+    ctx = RunContext()
+    one = fetch.load_staff('s1', api.Client())
+    two = fetch.load_staff('s2', api.Client())
+
+    assert not fetch.credits_cached([one], ctx)
+    fetch.ensure_credits([one], ctx, api.Client())
+    assert fetch.credits_cached([one], ctx)
+    assert not fetch.credits_cached([one, two], ctx)   # 人不同就不算命中
+
+    calls = len(fake.calls)
+    fetch.ensure_credits([one], ctx, api.Client())
+    assert len(fake.calls) == calls                    # 说命中就真的零请求
+
+
+def test_the_reuse_log_asks_fetch_instead_of_copying_its_cache_key(monkeypatch,
+                                                                   tmp_path):
+    """日志分支必须走 fetch.credits_cached；tool.py 自己重推一遍就会漂。"""
+    seed_library(monkeypatch, tmp_path, 's1')
+    online.FakeApi(online.vndb()).install(monkeypatch)
+    ctx = RecordingContext()
+    tool.preview(update_params(tmp_path), ctx)
+    log_count = len(ctx.logs)
+
+    monkeypatch.setattr(fetch, 'credits_cached', lambda _staffs, _ctx: False)
+    tool.run(update_params(tmp_path), ctx)
+    run_messages = [message for _level, message in ctx.logs[log_count:]]
+    assert any(message.startswith('开始处理出演记录')
+               for message in run_messages)
+    assert not any('出演记录：复用本次查询结果' in message
+                   for message in run_messages)
+
+
 def test_update_all_checks_cancel_before_each_write(monkeypatch, tmp_path):
     seed_library(monkeypatch, tmp_path, 's1', 's2')
     entries = []

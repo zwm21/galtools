@@ -334,6 +334,21 @@ def ensure_counts(staff, ctx, client):
     return slot[staff.sid]
 
 
+def _credits_key(staffs):
+    return tuple(s.sid for s in staffs)
+
+
+def credits_cached(staffs, ctx):
+    """这批人的出演记录是否已经在本次会话里抓全了。
+
+    调用方要靠它决定说哪句日志，但 key 怎么推、挂在 session 的哪个名字下都是
+    ensure_credits 的内部约定；抄一份到 tool.py 意味着这里改了那边不会跟着改，
+    日志会开始说与实际行为相反的话。
+    """
+    cached = ctx.session.get('credits')
+    return cached is not None and cached[0] == _credits_key(staffs)
+
+
 def _reporter(ctx, staff, base, grand):
     """把单人的 done/total 拼成横跨所有人的全局进度。"""
     def report(done, total):
@@ -354,7 +369,7 @@ def ensure_credits(staffs, ctx, client=None):
     换一个确定进度；这些 count 本来预览就已经缓存过了）。count 也可能失败，
     所以它同样按人捕获，失败的人直接从抓取循环里跳过。
     """
-    key = tuple(s.sid for s in staffs)
+    key = _credits_key(staffs)
     cached = ctx.session.get('credits')
     if cached is not None and cached[0] == key:
         return cached[1]
