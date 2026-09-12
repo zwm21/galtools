@@ -114,6 +114,26 @@ def test_scan_filters_extension_case_insensitively_and_recurses(tmp_path):
         'sub' + os.sep + 'voice_b.ogg', 'voice_a.OGG']
 
 
+def test_scan_order_does_not_depend_on_a_trailing_separator(tmp_path):
+    """源目录自带尾分隔符时顺序不变——盘符根（'E:\\'）就是这个形状。
+
+    这条挡的是「按 len(src)+1 切掉前缀」那种排序键：src 已经以分隔符结尾时它
+    多切一个字符，'b' 与 'ab' 这类并排的名字先后就反了。
+    """
+    src, _dst = make_dirs(tmp_path)
+    for name in ('b', 'ab'):
+        sub = src / name
+        sub.mkdir()
+        (sub / 'voice.ogg').write_bytes(b'x')
+
+    plain, _ = tool.scan_files(str(src), True, '.ogg')
+    trailing, _ = tool.scan_files(str(src) + os.sep, True, '.ogg')
+    order = [os.path.relpath(path, src) for path, _size in plain]
+    assert order == [os.path.join('ab', 'voice.ogg'),
+                     os.path.join('b', 'voice.ogg')]
+    assert [os.path.relpath(path, src) for path, _size in trailing] == order
+
+
 def test_scan_records_size_failures(tmp_path, monkeypatch):
     src, _dst = make_dirs(tmp_path)
     broken = src / 'voice_broken.ogg'
