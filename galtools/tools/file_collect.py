@@ -34,8 +34,21 @@ def _is_within(path, parent):
         return False
 
 
+def _missing_required(params):
+    """必填但空着的字段。标签从 TOOL.fields 上取，不在这里再抄一份。
+
+    GUI 早在调 validate 之前就用 form.missing_required_keys 拦掉了这些，所以
+    这段目前拦不到任何真实操作，它是给「绕开 GUI 直接调 run」的调用方准备的
+    兜底：现在没有这样的入口，将来加一个命令行就有了。空着往下走不会报错，只会
+    悄悄跑偏——src='' 被 ensure_scan 的 abspath 变成当前工作目录，
+    name_contains='' 则匹配该后缀的每一个文件。
+    """
+    return [(f.key, '必填：%s' % f.label) for f in TOOL.fields
+            if f.required and params.get(f.key) in (None, '')]
+
+
 def validate(params):
-    errors = []
+    errors = _missing_required(params)
     feature = params.get('feature') or ''
     needle = params.get('name_contains') or ''
     src = params.get('src') or ''
@@ -187,7 +200,14 @@ def _copy_contents(source, target, ctx):
 
 
 def atomic_copy(source, target, ctx):
-    """先复制到目标目录内的唯一临时文件，再原子且不覆盖地发布。"""
+    """先复制到目标目录内的唯一临时文件，再原子地发布。
+
+    「不覆盖」这一条只在 Windows 上成立：那里 os.rename 见到已存在的目标会抛
+    FileExistsError，copy_hits 接住它重新编号。POSIX 的 os.rename 静默覆盖，
+    那边挡住覆盖的就只剩 plan_destinations 开头列的那一次目录内容，规划之后才
+    出现的同名文件会被盖掉。本工具面向 Windows，这里不另写一份 O_EXCL 的实现，
+    只是别把这个承诺读成跨平台的。
+    """
     fd, temporary = tempfile.mkstemp(prefix='.%s.' % os.path.basename(target),
                                      suffix='.tmp', dir=os.path.dirname(target))
     os.close(fd)

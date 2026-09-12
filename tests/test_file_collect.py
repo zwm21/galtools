@@ -53,6 +53,38 @@ def test_name_match_is_literal_on_stem_and_optional_case_sensitive(tmp_path):
     assert not tool.name_matches(str(path), '.ogg', False)
 
 
+def test_validate_rejects_empty_required_fields(tmp_path):
+    """必填字段空着必须是错误，而不是一路往下跑到默认值上。
+
+    GUI 在调 validate 之前就拦掉了这些，所以这条守的是绕开 GUI 的调用方：
+    src='' 会被 abspath 变成当前工作目录，name_contains='' 匹配所有同后缀文件。
+    """
+    src, dst = make_dirs(tmp_path)
+    feature = tmp_path / 'voice.ogg'
+    feature.write_bytes(b'x')
+    assert tool.validate(params(feature, src, dst)) == []
+
+    for key, label in (('feature', '特征文件'), ('name_contains', '文件名包含'),
+                       ('src', '源目录'), ('dst', '目标目录')):
+        errors = tool.validate({**params(feature, src, dst), key: ''})
+        assert (key, '必填：%s' % label) in errors
+
+    # 两个可选开关取 False 不是「空着」，不能被当成没填
+    assert tool.validate(params(feature, src, dst, case_sensitive=False,
+                                recursive=False)) == []
+
+
+def test_run_refuses_to_start_on_empty_required_fields(tmp_path):
+    """run 自己也要拦。参数无效那句话丢掉了字段名，所以消息里得自带。"""
+    src, dst = make_dirs(tmp_path)
+    feature = tmp_path / 'voice.ogg'
+    feature.write_bytes(b'x')
+    (src / 'voice_a.ogg').write_bytes(b'a')
+    result = tool.run(params(feature, src, dst, name_contains=''), RunContext())
+    assert result.summary == '参数无效：必填：文件名包含'
+    assert list(dst.iterdir()) == []
+
+
 def test_validate_rejects_same_and_nested_target(tmp_path):
     src = tmp_path / 'src'
     src.mkdir()
